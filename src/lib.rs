@@ -7,8 +7,8 @@ pub mod volume;
 pub mod write;
 
 pub use access::{
-    AllocationAccess, BlockAccess, BlockWrite, ChainAccess, DirectoryAccess, Error, FatFs,
-    FileAccess, FileSystem, FoundEntry,
+    AllocationAccess, BlockAccess, BlockWrite, ChainAccess, DirectoryAccess, Error, FileAccess,
+    FileSystem, FoundEntry,
 };
 pub use format::FatType;
 pub use handle::{
@@ -16,4 +16,4 @@ pub use handle::{
     DirectoryLocation, FileHandle, FileInfo, MutableFileHandle,
 };
 pub use volume::{Cluster, Volume};
-pub use write::{DirectoryWrite, FileWrite, FreeDirectoryEntries};
+pub use write::{DirectoryWrite, FatFs, FileWrite, FreeDirectoryEntries};

@@ -24,6 +24,7 @@ pub enum Error<E> {
     NameTooLong,
     InvalidName,
     NotEmpty,
+    ReadOnly,
     OutOfBounds,
 }
 
@@ -425,10 +426,9 @@ pub trait DirectoryAccess: ChainAccess {
                     continue;
                 }
 
-                let lfn_matches = lfn_active
-                    && expected_ordinal == 0
-                    && raw.short_name().checksum() == checksum
-                    && long_name_matches(&long_name, name);
+                let valid_lfn =
+                    lfn_active && expected_ordinal == 0 && raw.short_name().checksum() == checksum;
+                let lfn_matches = valid_lfn && long_name_matches(&long_name, name);
                 let short_matches = raw.short_name().matches(name);
                 lfn_active = false;
                 if !raw.is_volume_label() && (lfn_matches || short_matches) {
@@ -438,7 +438,7 @@ pub trait DirectoryAccess: ChainAccess {
                             directory: directory.directory_info().location,
                             index: entry_index,
                         },
-                        lfn_start_index: lfn_matches.then_some(lfn_start_index).flatten(),
+                        lfn_start_index: valid_lfn.then_some(lfn_start_index).flatten(),
                     });
                 }
                 lfn_start_index = None;
@@ -544,6 +544,7 @@ pub trait FileAccess: DirectoryAccess {
         Ok(FileInfo {
             first_cluster,
             length,
+            attributes: entry.raw.attributes(),
             entry: entry.location,
         }
         .into())
@@ -854,7 +855,3 @@ pub trait AllocationAccess: ChainAccess + BlockWrite {
 }
 
 impl<D: BlockWrite> AllocationAccess for FileSystem<D> {}
-
-pub trait FatFs: FileAccess + AllocationAccess {}
-
-impl<T> FatFs for T where T: FileAccess + AllocationAccess {}

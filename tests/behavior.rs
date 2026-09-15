@@ -1,6 +1,7 @@
 use fatsd::{
     AllocationAccess, BasicDirectoryHandle, BasicFileHandle, BlockAccess, BlockWrite, ChainAccess,
-    DirectoryAccess, DirectoryWrite, FileAccess, FileHandle, FileInfo, FileSystem, FileWrite,
+    DirectoryAccess, DirectoryHandle, DirectoryLocation, DirectoryWrite, FileAccess, FileHandle,
+    FileInfo, FileSystem, FileWrite,
     format::{Bpb, FatEntry, LfnEntry, RawDirEntry, ShortName},
     volume::{Cluster, FatType, Volume},
 };
@@ -433,6 +434,105 @@ fn creates_writes_extends_and_truncates_a_file() {
     let mut regrown = [0xff; 500];
     assert_eq!(fs.read_file_at(&mut file, 200, &mut regrown).unwrap(), 500);
     assert_eq!(regrown, [0; 500]);
+}
+
+#[test]
+fn creates_moves_and_removes_directories_and_files() {
+    let mut fs = test_fs(FatType::Fat16);
+    fs.create_directory("/Parent").unwrap();
+    fs.create_directory("/Parent/Child").unwrap();
+    let mut file = fs.create_file("/Parent/Child/data.bin").unwrap();
+    fs.write_file_at(&mut file, 0, b"payload").unwrap();
+
+    assert!(matches!(
+        fs.remove_directory("/Parent"),
+        Err(fatsd::Error::NotEmpty)
+    ));
+    assert!(matches!(
+        fs.rename("/Parent", "/Parent/Child/Loop"),
+        Err(fatsd::Error::InvalidPath)
+    ));
+
+    fs.rename("/Parent/Child/data.bin", "/Parent/renamed long name.bin")
+        .unwrap();
+    assert!(matches!(
+        fs.open_file("/Parent/Child/data.bin"),
+        Err(fatsd::Error::NotFound)
+    ));
+    let mut renamed = fs.open_file("/Parent/renamed long name.bin").unwrap();
+    let mut contents = [0; 7];
+    fs.read_file_at(&mut renamed, 0, &mut contents).unwrap();
+    assert_eq!(&contents, b"payload");
+
+    fs.rename("/Parent/Child", "/Moved").unwrap();
+    assert_eq!(
+        fs.open_directory("/Moved/..").unwrap().directory_info(),
+        fs.root_directory().directory_info()
+    );
+
+    fs.remove_directory("/Moved").unwrap();
+    fs.remove_file("/Parent/renamed long name.bin").unwrap();
+    fs.remove_directory("/Parent").unwrap();
+    assert!(matches!(
+        fs.open_directory("/Parent"),
+        Err(fatsd::Error::NotFound)
+    ));
+}
+
+#[test]
+fn removing_by_short_alias_also_deletes_the_lfn_entries() {
+    let mut fs = test_fs(FatType::Fat16);
+    let file = fs.create_file("/remove long name.bin").unwrap();
+    let short_index = file.file_info().entry.index;
+
+    fs.remove_file("/REMOVE~1.BIN").unwrap();
+    let root = fs.root_directory();
+    for index in 0..=short_index {
+        assert!(
+            fs.read_directory_entry(&root, index)
+                .unwrap()
+                .unwrap()
+                .is_deleted()
+        );
+    }
+}
+
+#[test]
+fn grows_a_directory_chain_when_entries_fill_a_cluster() {
+    let mut fs = test_fs(FatType::Fat16);
+    let directory = fs.create_directory("/D").unwrap();
+    for index in 0..20 {
+        fs.create_file(&format!("/D/F{index:02}.TXT")).unwrap();
+    }
+    assert!(fs.open_file("/D/F19.TXT").is_ok());
+    let DirectoryLocation::Cluster(first) = directory.directory_info().location else {
+        panic!("new directory must use a cluster");
+    };
+    assert_eq!(fs.chain_tail_and_length(first).unwrap().1, 2);
+}
+
+#[test]
+fn rejects_mutation_of_a_read_only_file() {
+    let mut fs = test_fs(FatType::Fat16);
+    let file = fs.create_file("/READONLY.BIN").unwrap();
+    let mut raw = fs.read_directory_entry_at(file.file_info().entry).unwrap();
+    raw.0[11] |= RawDirEntry::ATTR_READ_ONLY;
+    fs.write_directory_entry(file.file_info().entry, raw)
+        .unwrap();
+    let mut file = fs.open_file("/READONLY.BIN").unwrap();
+
+    assert!(matches!(
+        fs.write_file_at(&mut file, 0, b"x"),
+        Err(fatsd::Error::ReadOnly)
+    ));
+    assert!(matches!(
+        fs.truncate_file(&mut file, 1),
+        Err(fatsd::Error::ReadOnly)
+    ));
+    assert!(matches!(
+        fs.remove_file("/READONLY.BIN"),
+        Err(fatsd::Error::ReadOnly)
+    ));
 }
 
 fn set_fat16(bytes: &mut [u8], fat_sector: usize, cluster: usize, value: u16) {

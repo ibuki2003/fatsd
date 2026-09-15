@@ -125,8 +125,10 @@ impl Bpb {
 pub struct RawDirEntry(pub [u8; DIRECTORY_ENTRY_SIZE]);
 
 impl RawDirEntry {
+    pub const ATTR_READ_ONLY: u8 = 0x01;
     pub const ATTR_VOLUME_ID: u8 = 0x08;
     pub const ATTR_DIRECTORY: u8 = 0x10;
+    pub const ATTR_ARCHIVE: u8 = 0x20;
     pub const ATTR_LONG_NAME: u8 = 0x0f;
 
     pub fn parse(bytes: &[u8]) -> Result<Self, FormatError> {
@@ -191,6 +193,10 @@ impl RawDirEntry {
         raw[..11].copy_from_slice(&name.0);
         raw[11] = attributes;
         Self(raw)
+    }
+
+    pub fn set_short_name(&mut self, name: ShortName) {
+        self.0[..11].copy_from_slice(&name.0);
     }
 
     pub fn set_first_cluster(&mut self, fat_type: FatType, cluster: Option<u32>) {

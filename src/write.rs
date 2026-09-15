@@ -1,8 +1,10 @@
 use core::cmp;
 
 use crate::{
-    access::{AllocationAccess, BlockWrite, DirectoryAccess, Error, FileAccess, FileSystem},
-    format::{DIRECTORY_ENTRY_SIZE, LfnEntry, RawDirEntry, ShortName},
+    access::{
+        AllocationAccess, BlockWrite, DirectoryAccess, Error, FileAccess, FileSystem, FoundEntry,
+    },
+    format::{DIRECTORY_ENTRY_SIZE, FatType, LfnEntry, RawDirEntry, ShortName},
     handle::{
         DirectoryEntryLocation, DirectoryHandle, DirectoryInfo, DirectoryLocation, FileHandle,
         FileInfo, MutableFileHandle,
@@ -155,10 +157,11 @@ pub trait DirectoryWrite: DirectoryAccess + AllocationAccess {
         }
     }
 
-    fn create_file(&mut self, path: &str) -> Result<Self::FileHandle, Error<Self::Error>>
-    where
-        Self: FileAccess,
-    {
+    fn create_named_entry(
+        &mut self,
+        path: &str,
+        mut entry: RawDirEntry,
+    ) -> Result<FoundEntry, Error<Self::Error>> {
         let (directory, name) = self.open_parent_directory(path)?;
         match self.find_entry(&directory, name) {
             Ok(_) => return Err(Error::AlreadyExists),
@@ -203,7 +206,8 @@ pub trait DirectoryWrite: DirectoryAccess + AllocationAccess {
             directory: directory.directory_info().location,
             index: slots.start_index + lfn_count as u32,
         };
-        self.write_directory_entry(short_location, RawDirEntry::new(short_name, 0x20))?;
+        entry.set_short_name(short_name);
+        self.write_directory_entry(short_location, entry)?;
         if slots.reached_end {
             let next = short_location.index + 1;
             if self.check_directory_capacity(&directory, next, 1).is_ok() {
@@ -216,12 +220,201 @@ pub trait DirectoryWrite: DirectoryAccess + AllocationAccess {
                 )?;
             }
         }
+        Ok(FoundEntry {
+            raw: entry,
+            location: short_location,
+            lfn_start_index: needs_lfn.then_some(slots.start_index),
+        })
+    }
+
+    fn create_file(&mut self, path: &str) -> Result<Self::FileHandle, Error<Self::Error>>
+    where
+        Self: FileAccess,
+    {
+        let found = self.create_named_entry(
+            path,
+            RawDirEntry::new(ShortName([b' '; 11]), RawDirEntry::ATTR_ARCHIVE),
+        )?;
         Ok(FileInfo {
             first_cluster: None,
             length: 0,
-            entry: short_location,
+            attributes: RawDirEntry::ATTR_ARCHIVE,
+            entry: found.location,
         }
         .into())
+    }
+
+    fn create_directory(
+        &mut self,
+        path: &str,
+    ) -> Result<Self::DirectoryHandle, Error<Self::Error>> {
+        let (parent, name) = self.open_parent_directory(path)?;
+        match self.find_entry(&parent, name) {
+            Ok(_) => return Err(Error::AlreadyExists),
+            Err(Error::NotFound) => {}
+            Err(error) => return Err(error),
+        }
+        let parent_location = parent.directory_info().location;
+        let cluster = self.allocate_cluster(None)?;
+        let mut dot = RawDirEntry::new(ShortName(*b".          "), RawDirEntry::ATTR_DIRECTORY);
+        dot.set_first_cluster(self.volume().fat_type, Some(cluster.get()));
+        let mut dot_dot = RawDirEntry::new(ShortName(*b"..         "), RawDirEntry::ATTR_DIRECTORY);
+        dot_dot.set_first_cluster(
+            self.volume().fat_type,
+            directory_cluster(self.volume(), parent_location),
+        );
+        let mut entries = [0; DIRECTORY_ENTRY_SIZE * 3];
+        entries[..DIRECTORY_ENTRY_SIZE].copy_from_slice(&dot.serialize());
+        entries[DIRECTORY_ENTRY_SIZE..DIRECTORY_ENTRY_SIZE * 2]
+            .copy_from_slice(&dot_dot.serialize());
+        if self.write_chain_at(cluster, 0, &entries)? != entries.len() {
+            return Err(Error::CorruptChain);
+        }
+
+        let mut entry = RawDirEntry::new(ShortName([b' '; 11]), RawDirEntry::ATTR_DIRECTORY);
+        entry.set_first_cluster(self.volume().fat_type, Some(cluster.get()));
+        if let Err(error) = self.create_named_entry(path, entry) {
+            let _ = self.free_chain(cluster);
+            return Err(error);
+        }
+        Ok(DirectoryInfo {
+            location: DirectoryLocation::Cluster(cluster),
+        }
+        .into())
+    }
+
+    fn delete_found_entry(&mut self, found: FoundEntry) -> Result<(), Error<Self::Error>> {
+        let start = found.lfn_start_index.unwrap_or(found.location.index);
+        for index in (start..=found.location.index).rev() {
+            let location = DirectoryEntryLocation {
+                directory: found.location.directory,
+                index,
+            };
+            let mut entry = self.read_directory_entry_at(location)?;
+            entry.0[0] = 0xe5;
+            self.write_directory_entry(location, entry)?;
+        }
+        Ok(())
+    }
+
+    fn remove_file(&mut self, path: &str) -> Result<(), Error<Self::Error>> {
+        let found = self.find_entry_by_path(path)?;
+        if found.raw.is_directory() || found.raw.is_volume_label() {
+            return Err(Error::NotAFile);
+        }
+        if found.raw.attributes() & RawDirEntry::ATTR_READ_ONLY != 0 {
+            return Err(Error::ReadOnly);
+        }
+        let first = Cluster::new(entry_cluster(self.volume(), &found.raw));
+        self.delete_found_entry(found)?;
+        if let Some(first) = first {
+            self.free_chain(first)?;
+        }
+        Ok(())
+    }
+
+    fn directory_is_empty(
+        &mut self,
+        directory: &Self::DirectoryHandle,
+    ) -> Result<bool, Error<Self::Error>> {
+        let mut index = 0u32;
+        loop {
+            let Some(entry) = self.read_directory_entry(directory, index)? else {
+                return Ok(true);
+            };
+            if !entry.is_deleted()
+                && !entry.is_lfn()
+                && !entry.is_volume_label()
+                && !entry.short_name().matches(".")
+                && !entry.short_name().matches("..")
+            {
+                return Ok(false);
+            }
+            index = index.checked_add(1).ok_or(Error::OutOfBounds)?;
+        }
+    }
+
+    fn remove_directory(&mut self, path: &str) -> Result<(), Error<Self::Error>> {
+        let found = self.find_entry_by_path(path)?;
+        if !found.raw.is_directory() {
+            return Err(Error::NotADirectory);
+        }
+        let cluster =
+            Cluster::new(entry_cluster(self.volume(), &found.raw)).ok_or(Error::CorruptChain)?;
+        let directory = DirectoryInfo {
+            location: DirectoryLocation::Cluster(cluster),
+        }
+        .into();
+        if !self.directory_is_empty(&directory)? {
+            return Err(Error::NotEmpty);
+        }
+        self.delete_found_entry(found)?;
+        self.free_chain(cluster)
+    }
+
+    fn rename(&mut self, source: &str, destination: &str) -> Result<(), Error<Self::Error>> {
+        let source = self.find_entry_by_path(source)?;
+        let (destination_parent, destination_name) = self.open_parent_directory(destination)?;
+        match self.find_entry(&destination_parent, destination_name) {
+            Ok(_) => return Err(Error::AlreadyExists),
+            Err(Error::NotFound) => {}
+            Err(error) => return Err(error),
+        }
+
+        if source.raw.is_directory() {
+            let source_cluster = Cluster::new(entry_cluster(self.volume(), &source.raw))
+                .ok_or(Error::CorruptChain)?;
+            if self.directory_contains(
+                DirectoryLocation::Cluster(source_cluster),
+                destination_parent.directory_info().location,
+            )? {
+                return Err(Error::InvalidPath);
+            }
+        }
+
+        self.create_named_entry(destination, source.raw)?;
+        if source.raw.is_directory()
+            && source.location.directory != destination_parent.directory_info().location
+        {
+            let source_cluster = Cluster::new(entry_cluster(self.volume(), &source.raw))
+                .ok_or(Error::CorruptChain)?;
+            let dot_dot_location = DirectoryEntryLocation {
+                directory: DirectoryLocation::Cluster(source_cluster),
+                index: 1,
+            };
+            let mut dot_dot = self.read_directory_entry_at(dot_dot_location)?;
+            dot_dot.set_first_cluster(
+                self.volume().fat_type,
+                directory_cluster(self.volume(), destination_parent.directory_info().location),
+            );
+            self.write_directory_entry(dot_dot_location, dot_dot)?;
+        }
+        self.delete_found_entry(source)
+    }
+
+    fn directory_contains(
+        &mut self,
+        ancestor: DirectoryLocation,
+        mut directory: DirectoryLocation,
+    ) -> Result<bool, Error<Self::Error>> {
+        for _ in 0..=self.volume().cluster_count {
+            if directory == ancestor {
+                return Ok(true);
+            }
+            if directory == self.volume().root_directory() {
+                return Ok(false);
+            }
+            let handle = DirectoryInfo {
+                location: directory,
+            }
+            .into();
+            let parent = self.find_entry(&handle, "..")?;
+            directory = match Cluster::new(entry_cluster(self.volume(), &parent.raw)) {
+                Some(cluster) => DirectoryLocation::Cluster(cluster),
+                None => self.volume().root_directory(),
+            };
+        }
+        Err(Error::CorruptChain)
     }
 
     fn open_parent_directory<'a>(
@@ -344,6 +537,9 @@ where
             return Ok(0);
         }
         let old = *file.file_info();
+        if old.attributes & RawDirEntry::ATTR_READ_ONLY != 0 {
+            return Err(Error::ReadOnly);
+        }
         let end = offset
             .checked_add(data.len() as u64)
             .filter(|end| *end <= u32::MAX as u64)
@@ -379,6 +575,9 @@ where
             return Err(Error::OutOfBounds);
         }
         let old = *file.file_info();
+        if old.attributes & RawDirEntry::ATTR_READ_ONLY != 0 {
+            return Err(Error::ReadOnly);
+        }
         if new_length == old.length {
             return Ok(());
         }
@@ -411,6 +610,19 @@ where
 
 impl<D: BlockWrite> FileWrite for FileSystem<D> {}
 
+pub trait FatFs: FileWrite
+where
+    Self::FileHandle: MutableFileHandle,
+{
+}
+
+impl<T> FatFs for T
+where
+    T: FileWrite,
+    T::FileHandle: MutableFileHandle,
+{
+}
+
 fn validate_name<E>(name: &str) -> Result<(), Error<E>> {
     if name.is_empty()
         || matches!(name, "." | "..")
@@ -429,6 +641,23 @@ fn validate_name<E>(name: &str) -> Result<(), Error<E>> {
         return Err(Error::NameTooLong);
     }
     Ok(())
+}
+
+fn entry_cluster(volume: &crate::Volume, entry: &RawDirEntry) -> u32 {
+    match volume.fat_type {
+        FatType::Fat12 | FatType::Fat16 => entry.first_cluster_low() as u32,
+        FatType::Fat32 => entry.first_cluster() & 0x0fff_ffff,
+    }
+}
+
+fn directory_cluster(volume: &crate::Volume, location: DirectoryLocation) -> Option<u32> {
+    match location {
+        DirectoryLocation::FixedRoot => match volume.fat_type {
+            FatType::Fat32 => Some(volume.bpb.root_cluster),
+            FatType::Fat12 | FatType::Fat16 => None,
+        },
+        DirectoryLocation::Cluster(cluster) => Some(cluster.get()),
+    }
 }
 
 fn encode_name<E>(name: &str, target: &mut [u16; 255]) -> Result<usize, Error<E>> {
@@ -496,8 +725,9 @@ fn short_alias(name: &str, ordinal: u32) -> ShortName {
 }
 
 fn sanitized_short_character(character: char) -> u8 {
-    if character.is_ascii() && is_short_character(character as u8) {
-        (character as u8).to_ascii_uppercase()
+    let upper = (character as u8).to_ascii_uppercase();
+    if character.is_ascii() && is_short_character(upper) {
+        upper
     } else {
         b'_'
     }

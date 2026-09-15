@@ -97,6 +97,42 @@ fn run() -> Result<(), String> {
     fs.write_file_at(&mut created, 257, &payload)
         .map_err(|error| format!("write created file failed: {error:?}"))?;
 
+    fs.create_directory("/Source directory")
+        .map_err(|error| format!("create source directory failed: {error:?}"))?;
+    fs.create_directory("/Source directory/Child")
+        .map_err(|error| format!("create child directory failed: {error:?}"))?;
+    let mut moving = fs
+        .create_file("/Source directory/Child/Moving payload.bin")
+        .map_err(|error| format!("create moving file failed: {error:?}"))?;
+    fs.write_file_at(&mut moving, 0, &payload)
+        .map_err(|error| format!("write moving file failed: {error:?}"))?;
+    fs.rename(
+        "/Source directory/Child/Moving payload.bin",
+        "/Nested/Moved payload.bin",
+    )
+    .map_err(|error| format!("move file failed: {error:?}"))?;
+    fs.rename("/Source directory/Child", "/Moved child")
+        .map_err(|error| format!("move directory failed: {error:?}"))?;
+    fs.remove_directory("/Moved child")
+        .map_err(|error| format!("remove moved directory failed: {error:?}"))?;
+    fs.remove_directory("/Source directory")
+        .map_err(|error| format!("remove source directory failed: {error:?}"))?;
+
+    let mut removed = fs
+        .create_file("/Removed file.bin")
+        .map_err(|error| format!("create removed file failed: {error:?}"))?;
+    fs.write_file_at(&mut removed, 0, &payload)
+        .map_err(|error| format!("write removed file failed: {error:?}"))?;
+    fs.remove_file("/REMOVE~1.BIN")
+        .map_err(|error| format!("remove file failed: {error:?}"))?;
+
+    fs.create_directory("/Expanded directory")
+        .map_err(|error| format!("create expanded directory failed: {error:?}"))?;
+    for index in 0..20 {
+        fs.create_file(&format!("/Expanded directory/F{index:02}.TXT"))
+            .map_err(|error| format!("grow directory failed: {error:?}"))?;
+    }
+
     println!("updated {:?} image", fs.volume_info().fat_type);
     Ok(())
 }

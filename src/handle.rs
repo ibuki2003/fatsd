@@ -40,6 +40,7 @@ impl DirectoryHandle for BasicDirectoryHandle {
 pub struct FileInfo {
     pub first_cluster: Option<Cluster>,
     pub length: u64,
+    pub attributes: u8,
     pub entry: DirectoryEntryLocation,
 }
 

@@ -5,7 +5,7 @@
 - `no_std`で利用できる同期API
 - FAT12 / FAT16 / FAT32
 - 論理セクタ長はBPBから取得。オンディスク位置はbyte offsetで計算し、物理blockへ分割
-- 公開操作: パスによるファイル検索、任意位置読み書き、ファイル作成・伸縮、FATチェインの参照・確保・解放
+- 公開操作: パスによるファイル検索、任意位置読み書き、ファイル作成・伸縮・削除・rename、ディレクトリ作成・削除・rename、FATチェインの参照・確保・解放
 
 ## モジュール
 
@@ -21,7 +21,7 @@
   - `AllocationAccess`: 空きクラスタ検索、リンク、解放
   - `FatFs`: 上記機能をまとめるmarker trait
 - `handle`: default実装が扱う、ファイルとディレクトリの最小メタデータ
-- `write`: directory entry更新、ファイル作成、任意位置書き込み、伸縮
+- `write`: directory entry更新、ファイル/ディレクトリ作成・削除・rename、任意位置書き込み、伸縮
 
 ## trait案
 
@@ -194,24 +194,32 @@ pub trait AllocationAccess: ChainAccess + BlockWrite {
 
 `write_fat_entry`はBPBのmirroring設定に従う。FAT32 entryの上位4 bitはread-modify-writeで保存する。`allocate_cluster`は新clusterをEOCにしてから既存chainへ接続し、中断時に既存chainを壊しにくい順に書く。
 
-cluster内容のzero clearはallocationとは別責任にする案と、再利用データ露出を防ぐためallocateに含める案がある。ファイル作成APIを入れる段階で決定する。初期のchain操作だけならzero clearは行わない。
+`allocate_cluster`は新clusterをzero clearしてから既存chainへ接続し、再利用データがファイルのgapや新規directoryから露出しない状態を保つ。
 
 ### `FatFs`
 
 ```rust
-pub trait FatFs: FileAccess + AllocationAccess {}
+pub trait FatFs: FileWrite
+where
+    Self::FileHandle: MutableFileHandle,
+{}
 
-impl<T> FatFs for T where T: FileAccess + AllocationAccess {}
+impl<T> FatFs for T
+where
+    T: FileWrite,
+    T::FileHandle: MutableFileHandle,
+{}
 ```
 
 機能を束ねるだけのmarker trait。固有のdefault methodは置かない。読み取り専用実装は`FileAccess`まで実装でき、`BlockWrite`の偽実装を必要としない。
 
 ### `DirectoryWrite` / `FileWrite`
 
-- `DirectoryWrite`: 空きentry列の検索、LFN/short alias生成、directory chainの伸長、`create_file`
+- `DirectoryWrite`: 空きentry列の検索、LFN/short alias生成、directory chainの伸長、ファイル/ディレクトリ作成・削除・rename
 - `FileWrite`: `write_file_at`, `truncate_file`、directory entry上の先頭cluster/file size更新
 - `MutableFileHandle`: 書き込み後の`FileInfo`更新だけを要求。読み取り専用`FileHandle`とは分離
 - FAT32 allocation後: FSInfoのfree count/next freeを仕様上のunknown値へ更新
+- directory rename: 新entryを作成してから旧entryを削除。親が変わる場合は`..`を更新し、子孫への移動は拒否
 
 ## 利用側に必要なimpl
 
@@ -249,6 +257,8 @@ impl<D: BlockWrite> BlockWrite for MyFileSystem<D> {
 }
 
 impl<D: BlockWrite> AllocationAccess for MyFileSystem<D> {}
+impl<D: BlockWrite> DirectoryWrite for MyFileSystem<D> {}
+impl<D: BlockWrite> FileWrite for MyFileSystem<D> {}
 ```
 
 つまり、必須の実処理はblock I/Oの委譲と`volume()`だけ。ハンドル関連は型指定だけで、FAT、directory、file、allocationの通常処理はdefault implになる。
@@ -300,6 +310,12 @@ pub enum Error<E> {
     NotADirectory,
     InvalidPath,
     NoSpace,
+    AlreadyExists,
+    DirectoryFull,
+    NameTooLong,
+    InvalidName,
+    NotEmpty,
+    ReadOnly,
     OutOfBounds,
 }
 ```
@@ -339,11 +355,11 @@ Rustでは上書きしたtrait methodから、そのtraitのdefault実装を`sup
 
 ### handle traitの可変情報
 
-default実装がファイル位置を保持しない`read_at`方式ならimmutableな`FileInfo` viewだけで足りる。将来sequential read/write cursorを追加する場合は、既存`FileHandle`へsetterを足さず、別の`CursorHandle` traitまたはwrapperを設ける。
+default実装がファイル位置を保持しない`read_at`方式では`FileHandle`のimmutableなviewだけを使う。書き込みは別の`MutableFileHandle`で先頭cluster、size、attributes、directory entry位置の更新を要求する。将来sequential cursorを追加する場合は、これらへcursor位置を混ぜず別traitまたはwrapperを設ける。
 
 ### allocationと一貫性
 
-FATにはtransactionがない。複数FAT copy、クラスタリンク、directory entry、file sizeを跨ぐ完全な原子性はこのtrait分割だけでは提供できない。初期`AllocationAccess`はチェイン操作に限定し、ファイル作成・伸長APIを追加するときに更新順と失敗時保証を別途設計する。
+FATにはtransactionがないため、複数FAT copy、クラスタリンク、directory entry、file sizeを跨ぐ完全な原子性は提供しない。既存chainを壊しにくい順序を採用し、伸長は新clusterの初期化後に接続、縮小はfile size更新後に余剰chainを解放、削除はentryを不可視化してからchainを解放、renameは新entryを公開してから旧entryを削除する。
 
 ## テスト
 
@@ -351,5 +367,7 @@ FATにはtransactionがない。複数FAT copy、クラスタリンク、directo
 - FAT12 / FAT16 / FAT32のFATエントリ境界
 - メモリ上の最小FATイメージによるLFN/短名のパス検索とクラスタ境界を跨ぐread
 - allocationのリンク・解放
+- ファイル作成、gapを含む伸長、縮小、read-only拒否
+- directory chain伸長、ファイル/ディレクトリ削除、親を跨ぐrename、循環拒否
 
 時刻更新とFSInfoの空き数最適化は含めない。FSInfoはallocation後にunknownへ戻し、他実装が古い値を利用しない状態を保つ。
