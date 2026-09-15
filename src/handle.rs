@@ -11,6 +11,12 @@ pub struct DirectoryInfo {
     pub location: DirectoryLocation,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct DirectoryEntryLocation {
+    pub directory: DirectoryLocation,
+    pub index: u32,
+}
+
 pub trait DirectoryHandle {
     fn directory_info(&self) -> &DirectoryInfo;
 }
@@ -34,10 +40,15 @@ impl DirectoryHandle for BasicDirectoryHandle {
 pub struct FileInfo {
     pub first_cluster: Option<Cluster>,
     pub length: u64,
+    pub entry: DirectoryEntryLocation,
 }
 
 pub trait FileHandle {
     fn file_info(&self) -> &FileInfo;
+}
+
+pub trait MutableFileHandle: FileHandle {
+    fn file_info_mut(&mut self) -> &mut FileInfo;
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -52,5 +63,11 @@ impl From<FileInfo> for BasicFileHandle {
 impl FileHandle for BasicFileHandle {
     fn file_info(&self) -> &FileInfo {
         &self.0
+    }
+}
+
+impl MutableFileHandle for BasicFileHandle {
+    fn file_info_mut(&mut self) -> &mut FileInfo {
+        &mut self.0
     }
 }

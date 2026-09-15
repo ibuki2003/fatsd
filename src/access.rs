@@ -3,8 +3,8 @@ use core::cmp;
 use crate::{
     format::{Bpb, DIRECTORY_ENTRY_SIZE, FatEntry, FatType, FormatError, LfnEntry, RawDirEntry},
     handle::{
-        BasicDirectoryHandle, BasicFileHandle, DirectoryHandle, DirectoryInfo, DirectoryLocation,
-        FileHandle, FileInfo,
+        BasicDirectoryHandle, BasicFileHandle, DirectoryEntryLocation, DirectoryHandle,
+        DirectoryInfo, DirectoryLocation, FileHandle, FileInfo,
     },
     volume::{Cluster, Volume},
 };
@@ -19,6 +19,11 @@ pub enum Error<E> {
     NotADirectory,
     InvalidPath,
     NoSpace,
+    AlreadyExists,
+    DirectoryFull,
+    NameTooLong,
+    InvalidName,
+    NotEmpty,
     OutOfBounds,
 }
 
@@ -312,6 +317,8 @@ fn validate_cluster<E>(volume: &Volume, cluster: Cluster) -> Result<(), Error<E>
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct FoundEntry {
     pub raw: RawDirEntry,
+    pub location: DirectoryEntryLocation,
+    pub lfn_start_index: Option<u32>,
 }
 
 pub trait DirectoryAccess: ChainAccess {
@@ -374,6 +381,7 @@ pub trait DirectoryAccess: ChainAccess {
         let mut expected_ordinal = 0u8;
         let mut checksum = 0u8;
         let mut lfn_active = false;
+        let mut lfn_start_index = None;
 
         loop {
             let read = self.read_directory_at(directory, byte_offset, &mut batch)?;
@@ -381,13 +389,17 @@ pub trait DirectoryAccess: ChainAccess {
                 return Err(Error::NotFound);
             }
             let (entries, _) = batch[..read].as_chunks::<DIRECTORY_ENTRY_SIZE>();
-            for raw_bytes in entries {
+            for (batch_index, raw_bytes) in entries.iter().enumerate() {
+                let entry_index =
+                    u32::try_from(byte_offset / DIRECTORY_ENTRY_SIZE as u64 + batch_index as u64)
+                        .map_err(|_| Error::OutOfBounds)?;
                 let raw = RawDirEntry(*raw_bytes);
                 if raw.is_end() {
                     return Err(Error::NotFound);
                 }
                 if raw.is_deleted() {
                     lfn_active = false;
+                    lfn_start_index = None;
                     continue;
                 }
                 if raw.is_lfn() {
@@ -400,9 +412,11 @@ pub trait DirectoryAccess: ChainAccess {
                         expected_ordinal = lfn.ordinal;
                         checksum = lfn.checksum;
                         lfn_active = true;
+                        lfn_start_index = Some(entry_index);
                     }
                     if !lfn_active || lfn.ordinal != expected_ordinal || lfn.checksum != checksum {
                         lfn_active = false;
+                        lfn_start_index = None;
                         continue;
                     }
                     let start = (lfn.ordinal as usize - 1) * 13;
@@ -418,8 +432,16 @@ pub trait DirectoryAccess: ChainAccess {
                 let short_matches = raw.short_name().matches(name);
                 lfn_active = false;
                 if !raw.is_volume_label() && (lfn_matches || short_matches) {
-                    return Ok(FoundEntry { raw });
+                    return Ok(FoundEntry {
+                        raw,
+                        location: DirectoryEntryLocation {
+                            directory: directory.directory_info().location,
+                            index: entry_index,
+                        },
+                        lfn_start_index: lfn_matches.then_some(lfn_start_index).flatten(),
+                    });
                 }
+                lfn_start_index = None;
             }
             let consumed = entries.len() * DIRECTORY_ENTRY_SIZE;
             if consumed == 0 {
@@ -522,6 +544,7 @@ pub trait FileAccess: DirectoryAccess {
         Ok(FileInfo {
             first_cluster,
             length,
+            entry: entry.location,
         }
         .into())
     }
@@ -623,6 +646,21 @@ pub trait AllocationAccess: ChainAccess + BlockWrite {
             let start = volume.sector_byte_offset(start_sector);
             self.write_one_fat_entry(start, cluster, value)?;
         }
+        self.invalidate_fs_info()?;
+        Ok(())
+    }
+
+    fn invalidate_fs_info(&mut self) -> Result<(), Error<Self::Error>> {
+        let volume = *self.volume();
+        let sector = volume.bpb.fs_info_sector;
+        if volume.fat_type == FatType::Fat32
+            && sector != 0
+            && sector != u16::MAX
+            && sector < volume.bpb.reserved_sector_count
+        {
+            let offset = volume.sector_byte_offset(sector as u32) + 488;
+            self.write_volume_at(offset, &[0xff; 8])?;
+        }
         Ok(())
     }
 
@@ -680,10 +718,125 @@ pub trait AllocationAccess: ChainAccess + BlockWrite {
         }
         let cluster = self.find_free_cluster(after)?;
         self.write_fat_entry(cluster, FatEntry::EndOfChain)?;
+        self.clear_cluster(cluster)?;
         if let Some(previous) = after {
             self.write_fat_entry(previous, FatEntry::Data(cluster.get()))?;
         }
         Ok(cluster)
+    }
+
+    fn clear_cluster(&mut self, cluster: Cluster) -> Result<(), Error<Self::Error>> {
+        let start = self
+            .volume()
+            .cluster_byte_offset(cluster)
+            .ok_or(Error::CorruptChain)?;
+        let mut offset = 0;
+        let zeros = [0; 512];
+        while offset < self.volume().cluster_size() {
+            let length = cmp::min(zeros.len(), self.volume().cluster_size() - offset);
+            self.write_volume_at(start + offset as u64, &zeros[..length])?;
+            offset += length;
+        }
+        Ok(())
+    }
+
+    fn chain_tail_and_length(
+        &mut self,
+        first: Cluster,
+    ) -> Result<(Cluster, u32), Error<Self::Error>> {
+        let mut current = first;
+        for length in 1..=self.volume().cluster_count {
+            let Some(next) = self.next_cluster(current)? else {
+                return Ok((current, length));
+            };
+            current = next;
+        }
+        Err(Error::CorruptChain)
+    }
+
+    fn ensure_chain_length(
+        &mut self,
+        first: &mut Option<Cluster>,
+        required: u32,
+    ) -> Result<(), Error<Self::Error>> {
+        if required == 0 {
+            return Ok(());
+        }
+        let (mut tail, mut length) = if let Some(first) = *first {
+            self.chain_tail_and_length(first)?
+        } else {
+            let allocated = self.allocate_cluster(None)?;
+            *first = Some(allocated);
+            (allocated, 1)
+        };
+        while length < required {
+            tail = self.allocate_cluster(Some(tail))?;
+            length += 1;
+        }
+        Ok(())
+    }
+
+    fn truncate_chain(
+        &mut self,
+        first: Option<Cluster>,
+        keep_clusters: u32,
+    ) -> Result<Option<Cluster>, Error<Self::Error>> {
+        let Some(first) = first else {
+            return Ok(None);
+        };
+        if keep_clusters == 0 {
+            self.free_chain(first)?;
+            return Ok(None);
+        }
+        let last = self
+            .cluster_at(first, keep_clusters - 1)?
+            .ok_or(Error::CorruptChain)?;
+        let tail = self.next_cluster(last)?;
+        if let Some(tail) = tail {
+            self.write_fat_entry(last, FatEntry::EndOfChain)?;
+            self.free_chain(tail)?;
+        }
+        Ok(Some(first))
+    }
+
+    fn write_chain_at(
+        &mut self,
+        first: Cluster,
+        offset: u64,
+        data: &[u8],
+    ) -> Result<usize, Error<Self::Error>> {
+        let cluster_size = self.volume().cluster_size() as u64;
+        let cluster_index = offset / cluster_size;
+        let mut within_cluster = (offset % cluster_size) as usize;
+        let Some(mut cluster) = self.cluster_at(
+            first,
+            u32::try_from(cluster_index).map_err(|_| Error::OutOfBounds)?,
+        )?
+        else {
+            return Ok(0);
+        };
+        let mut written = 0;
+        while written < data.len() {
+            let length = cmp::min(
+                self.volume().cluster_size() - within_cluster,
+                data.len() - written,
+            );
+            let byte_offset = self
+                .volume()
+                .cluster_byte_offset(cluster)
+                .ok_or(Error::CorruptChain)?
+                + within_cluster as u64;
+            self.write_volume_at(byte_offset, &data[written..written + length])?;
+            written += length;
+            within_cluster = 0;
+            if written < data.len() {
+                let Some(next) = self.next_cluster(cluster)? else {
+                    break;
+                };
+                cluster = next;
+            }
+        }
+        Ok(written)
     }
 
     fn free_chain(&mut self, first: Cluster) -> Result<(), Error<Self::Error>> {

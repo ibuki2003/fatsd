@@ -185,6 +185,28 @@ impl RawDirEntry {
     pub fn file_size(&self) -> u32 {
         le32(&self.0, 28)
     }
+
+    pub fn new(name: ShortName, attributes: u8) -> Self {
+        let mut raw = [0; DIRECTORY_ENTRY_SIZE];
+        raw[..11].copy_from_slice(&name.0);
+        raw[11] = attributes;
+        Self(raw)
+    }
+
+    pub fn set_first_cluster(&mut self, fat_type: FatType, cluster: Option<u32>) {
+        let cluster = cluster.unwrap_or(0);
+        let high = if fat_type == FatType::Fat32 {
+            ((cluster & 0x0fff_ffff) >> 16) as u16
+        } else {
+            0
+        };
+        put16(&mut self.0, 20, high);
+        put16(&mut self.0, 26, cluster as u16);
+    }
+
+    pub fn set_file_size(&mut self, size: u32) {
+        put32(&mut self.0, 28, size);
+    }
 }
 
 impl fmt::Debug for RawDirEntry {

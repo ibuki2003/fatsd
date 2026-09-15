@@ -1,6 +1,6 @@
 use fatsd::{
     AllocationAccess, BasicDirectoryHandle, BasicFileHandle, BlockAccess, BlockWrite, ChainAccess,
-    DirectoryAccess, FileAccess, FileHandle, FileInfo, FileSystem,
+    DirectoryAccess, DirectoryWrite, FileAccess, FileHandle, FileInfo, FileSystem, FileWrite,
     format::{Bpb, FatEntry, LfnEntry, RawDirEntry, ShortName},
     volume::{Cluster, FatType, Volume},
 };
@@ -109,6 +109,8 @@ impl FileAccess for TestFs {
 }
 
 impl AllocationAccess for TestFs {}
+impl DirectoryWrite for TestFs {}
+impl FileWrite for TestFs {}
 
 struct ClmtHandle {
     info: FileInfo,
@@ -403,6 +405,34 @@ fn custom_file_handle_can_resolve_all_clusters_without_fat_reads() {
     assert_eq!(fs.sequential_lookups, 1);
     assert_eq!(&output[..12], &[b'a'; 12]);
     assert_eq!(&output[12..], &[b'b'; 88]);
+}
+
+#[test]
+fn creates_writes_extends_and_truncates_a_file() {
+    let mut fs = test_fs(FatType::Fat16);
+    fs.device.bytes[4 * 512..].fill(0xa5);
+    let mut file = fs.create_file("/created long name.bin").unwrap();
+    let payload = [0x5a; 600];
+
+    assert_eq!(fs.write_file_at(&mut file, 100, &payload).unwrap(), 600);
+    assert_eq!(file.file_info().length, 700);
+    let mut contents = [0xff; 700];
+    assert_eq!(fs.read_file_at(&mut file, 0, &mut contents).unwrap(), 700);
+    assert_eq!(&contents[..100], &[0; 100]);
+    assert_eq!(&contents[100..], &payload);
+    assert!(fs.open_file("/created long name.bin").is_ok());
+
+    fs.truncate_file(&mut file, 200).unwrap();
+    assert_eq!(file.file_info().length, 200);
+    assert_eq!(
+        fs.read_fat_entry(Cluster::new(3).unwrap()).unwrap(),
+        FatEntry::Free
+    );
+
+    fs.truncate_file(&mut file, 700).unwrap();
+    let mut regrown = [0xff; 500];
+    assert_eq!(fs.read_file_at(&mut file, 200, &mut regrown).unwrap(), 500);
+    assert_eq!(regrown, [0; 500]);
 }
 
 fn set_fat16(bytes: &mut [u8], fat_sector: usize, cluster: usize, value: u16) {

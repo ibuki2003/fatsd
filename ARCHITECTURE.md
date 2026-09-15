@@ -5,7 +5,7 @@
 - `no_std`で利用できる同期API
 - FAT12 / FAT16 / FAT32
 - 論理セクタ長はBPBから取得。オンディスク位置はbyte offsetで計算し、物理blockへ分割
-- 初期実装の公開操作: パスによるファイル検索、任意位置読み出し、FATチェインの参照・確保・解放
+- 公開操作: パスによるファイル検索、任意位置読み書き、ファイル作成・伸縮、FATチェインの参照・確保・解放
 
 ## モジュール
 
@@ -21,6 +21,7 @@
   - `AllocationAccess`: 空きクラスタ検索、リンク、解放
   - `FatFs`: 上記機能をまとめるmarker trait
 - `handle`: default実装が扱う、ファイルとディレクトリの最小メタデータ
+- `write`: directory entry更新、ファイル作成、任意位置書き込み、伸縮
 
 ## trait案
 
@@ -205,6 +206,13 @@ impl<T> FatFs for T where T: FileAccess + AllocationAccess {}
 
 機能を束ねるだけのmarker trait。固有のdefault methodは置かない。読み取り専用実装は`FileAccess`まで実装でき、`BlockWrite`の偽実装を必要としない。
 
+### `DirectoryWrite` / `FileWrite`
+
+- `DirectoryWrite`: 空きentry列の検索、LFN/short alias生成、directory chainの伸長、`create_file`
+- `FileWrite`: `write_file_at`, `truncate_file`、directory entry上の先頭cluster/file size更新
+- `MutableFileHandle`: 書き込み後の`FileInfo`更新だけを要求。読み取り専用`FileHandle`とは分離
+- FAT32 allocation後: FSInfoのfree count/next freeを仕様上のunknown値へ更新
+
 ## 利用側に必要なimpl
 
 crate提供の基本ハンドルを使う最小構成:
@@ -344,4 +352,4 @@ FATにはtransactionがない。複数FAT copy、クラスタリンク、directo
 - メモリ上の最小FATイメージによるLFN/短名のパス検索とクラスタ境界を跨ぐread
 - allocationのリンク・解放
 
-完全なファイル作成、ディレクトリ更新、時刻更新、FSInfoの空き数最適化は初期範囲に含めない。これらはallocationとdirectory更新を組み合わせる上位操作として追加する。
+時刻更新とFSInfoの空き数最適化は含めない。FSInfoはallocation後にunknownへ戻し、他実装が古い値を利用しない状態を保つ。
