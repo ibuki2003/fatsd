@@ -204,11 +204,7 @@ where
     Self::FileHandle: MutableFileHandle,
 {}
 
-impl<T> FatFs for T
-where
-    T: FileWrite,
-    T::FileHandle: MutableFileHandle,
-{}
+// blanket implは提供しない。利用側のfilesystem型が明示的に実装する。
 ```
 
 機能を束ねるだけのmarker trait。固有のdefault methodは置かない。読み取り専用実装は`FileAccess`まで実装でき、`BlockWrite`の偽実装を必要としない。
@@ -259,13 +255,12 @@ impl<D: BlockWrite> BlockWrite for MyFileSystem<D> {
 impl<D: BlockWrite> AllocationAccess for MyFileSystem<D> {}
 impl<D: BlockWrite> DirectoryWrite for MyFileSystem<D> {}
 impl<D: BlockWrite> FileWrite for MyFileSystem<D> {}
+impl<D: BlockWrite> FatFs for MyFileSystem<D> {}
 ```
 
 つまり、必須の実処理はblock I/Oの委譲と`volume()`だけ。ハンドル関連は型指定だけで、FAT、directory、file、allocationの通常処理はdefault implになる。
 
-crateには同じ構成の`FileSystem<D>`も用意し、`FileSystem::new(device)`でboot sectorを読み、`Bpb`と`Volume`を構築する。失敗しうるので実際の返り値は`Result<Self, Error<D::Error>>`とする。
-
-`FileSystem::new`は渡されたdeviceのbyte 0をvolume先頭とする。MBR/GPTのpartition探索は別責任とし、partition範囲を切り出す`BlockAccess` decoratorで対応する。
+crateはfilesystem structと各filesystem traitのblanket implを提供しない。`read_volume(&mut device)`でboot sectorから`Volume`を構築し、利用側のstructがdeviceとともに保持する。渡されたdeviceのbyte 0をvolume先頭とし、MBR/GPTのpartition探索は別責任とする。
 
 ## default implの呼び出し経路
 

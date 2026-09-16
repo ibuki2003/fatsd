@@ -1,9 +1,7 @@
 use core::cmp;
 
 use crate::{
-    access::{
-        AllocationAccess, BlockWrite, DirectoryAccess, Error, FileAccess, FileSystem, FoundEntry,
-    },
+    access::{AllocationAccess, DirectoryAccess, Error, FileAccess, FoundEntry},
     format::{DIRECTORY_ENTRY_SIZE, FatType, LfnEntry, RawDirEntry, ShortName},
     handle::{
         DirectoryEntryLocation, DirectoryHandle, DirectoryInfo, DirectoryLocation, FileHandle,
@@ -455,8 +453,6 @@ pub trait DirectoryWrite: DirectoryAccess + AllocationAccess {
     }
 }
 
-impl<D: BlockWrite> DirectoryWrite for FileSystem<D> {}
-
 pub trait FileWrite: FileAccess + DirectoryWrite
 where
     Self::FileHandle: MutableFileHandle,
@@ -608,18 +604,9 @@ where
     }
 }
 
-impl<D: BlockWrite> FileWrite for FileSystem<D> {}
-
 pub trait FatFs: FileWrite
 where
     Self::FileHandle: MutableFileHandle,
-{
-}
-
-impl<T> FatFs for T
-where
-    T: FileWrite,
-    T::FileHandle: MutableFileHandle,
 {
 }
 

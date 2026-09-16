@@ -1,8 +1,9 @@
 use fatsd::{
     AllocationAccess, BasicDirectoryHandle, BasicFileHandle, BlockAccess, BlockWrite, ChainAccess,
-    DirectoryAccess, DirectoryHandle, DirectoryLocation, DirectoryWrite, FileAccess, FileHandle,
-    FileInfo, FileSystem, FileWrite,
+    DirectoryAccess, DirectoryHandle, DirectoryLocation, DirectoryWrite, FatFs, FileAccess,
+    FileHandle, FileInfo, FileWrite,
     format::{Bpb, FatEntry, LfnEntry, RawDirEntry, ShortName},
+    read_volume,
     volume::{Cluster, FatType, Volume},
 };
 
@@ -112,6 +113,7 @@ impl FileAccess for TestFs {
 impl AllocationAccess for TestFs {}
 impl DirectoryWrite for TestFs {}
 impl FileWrite for TestFs {}
+impl FatFs for TestFs {}
 
 struct ClmtHandle {
     info: FileInfo,
@@ -270,8 +272,8 @@ fn filesystem_mounts_a_borrowed_partial_block_device() {
         block_size: 128,
     };
 
-    let fs = FileSystem::new(&mut device).unwrap();
-    assert_eq!(fs.volume_info().fat_type, FatType::Fat12);
+    let volume = read_volume(&mut device).unwrap();
+    assert_eq!(volume.fat_type, FatType::Fat12);
 }
 
 #[test]

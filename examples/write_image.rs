@@ -9,7 +9,10 @@ use std::{
     process,
 };
 
-use fatsd::{BlockAccess, BlockWrite, DirectoryWrite, FileAccess, FileSystem, FileWrite};
+use fatsd::{BlockAccess, BlockWrite, DirectoryWrite, FileAccess, FileWrite};
+
+mod support;
+use support::Fs;
 
 struct Image {
     file: File,
@@ -79,7 +82,7 @@ fn run() -> Result<(), String> {
             .map_err(|error| error.to_string())?,
         block_size: 128,
     };
-    let mut fs = FileSystem::new(image).map_err(|error| format!("mount failed: {error:?}"))?;
+    let mut fs = Fs::mount(image).map_err(|error| format!("mount failed: {error:?}"))?;
 
     let mut existing = fs
         .open_file("/Existing.bin")

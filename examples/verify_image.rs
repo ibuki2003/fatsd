@@ -9,7 +9,10 @@ use std::{
     process,
 };
 
-use fatsd::{BlockAccess, FileAccess, FileHandle, FileSystem};
+use fatsd::{BlockAccess, FileAccess, FileHandle};
+
+mod support;
+use support::Fs;
 
 struct Image {
     file: File,
@@ -65,7 +68,7 @@ fn run() -> Result<(), String> {
         // The test intentionally uses blocks smaller than a FAT sector to exercise splitting.
         block_size: 128,
     };
-    let mut fs = FileSystem::new(image).map_err(|error| format!("mount failed: {error:?}"))?;
+    let mut fs = Fs::mount(image).map_err(|error| format!("mount failed: {error:?}"))?;
     let mut file = fs
         .open_file(&fat_path)
         .map_err(|error| format!("open failed: {error:?}"))?;

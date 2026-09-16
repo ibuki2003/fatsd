@@ -8,7 +8,7 @@ pub mod write;
 
 pub use access::{
     AllocationAccess, BlockAccess, BlockWrite, ChainAccess, DirectoryAccess, Error, FileAccess,
-    FileSystem, FoundEntry,
+    FoundEntry, read_volume,
 };
 pub use format::FatType;
 pub use handle::{

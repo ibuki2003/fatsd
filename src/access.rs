@@ -3,8 +3,8 @@ use core::cmp;
 use crate::{
     format::{Bpb, DIRECTORY_ENTRY_SIZE, FatEntry, FatType, FormatError, LfnEntry, RawDirEntry},
     handle::{
-        BasicDirectoryHandle, BasicFileHandle, DirectoryEntryLocation, DirectoryHandle,
-        DirectoryInfo, DirectoryLocation, FileHandle, FileInfo,
+        DirectoryEntryLocation, DirectoryHandle, DirectoryInfo, DirectoryLocation, FileHandle,
+        FileInfo,
     },
     volume::{Cluster, Volume},
 };
@@ -136,62 +136,10 @@ fn write_device_at<T: BlockWrite + ?Sized>(
     Ok(())
 }
 
-pub struct FileSystem<D> {
-    device: D,
-    volume: Volume,
-}
-
-impl<D: BlockAccess> FileSystem<D> {
-    pub fn new(mut device: D) -> Result<Self, Error<D::Error>> {
-        let mut boot_sector = [0; 512];
-        read_device_at(&mut device, 0, &mut boot_sector)?;
-        let volume = Volume::from_bpb(Bpb::parse(&boot_sector)?)?;
-        Ok(Self { device, volume })
-    }
-
-    pub const fn volume_info(&self) -> &Volume {
-        &self.volume
-    }
-
-    pub const fn device(&self) -> &D {
-        &self.device
-    }
-
-    pub fn device_mut(&mut self) -> &mut D {
-        &mut self.device
-    }
-
-    pub fn into_inner(self) -> D {
-        self.device
-    }
-}
-
-impl<D: BlockAccess> BlockAccess for FileSystem<D> {
-    type Error = D::Error;
-
-    fn block_size(&self) -> usize {
-        self.device.block_size()
-    }
-
-    fn read_block_at(
-        &mut self,
-        block: u64,
-        offset: usize,
-        out: &mut [u8],
-    ) -> Result<(), Self::Error> {
-        self.device.read_block_at(block, offset, out)
-    }
-}
-
-impl<D: BlockWrite> BlockWrite for FileSystem<D> {
-    fn write_block_at(
-        &mut self,
-        block: u64,
-        offset: usize,
-        data: &[u8],
-    ) -> Result<(), Self::Error> {
-        self.device.write_block_at(block, offset, data)
-    }
+pub fn read_volume<T: BlockAccess + ?Sized>(device: &mut T) -> Result<Volume, Error<T::Error>> {
+    let mut boot_sector = [0; 512];
+    read_device_at(device, 0, &mut boot_sector)?;
+    Ok(Volume::from_bpb(Bpb::parse(&boot_sector)?)?)
 }
 
 pub trait ChainAccess: BlockAccess {
@@ -298,12 +246,6 @@ pub trait ChainAccess: BlockAccess {
             }
         }
         Ok(read)
-    }
-}
-
-impl<D: BlockAccess> ChainAccess for FileSystem<D> {
-    fn volume(&self) -> &Volume {
-        &self.volume
     }
 }
 
@@ -524,10 +466,6 @@ fn entry_first_cluster(volume: &Volume, entry: &RawDirEntry) -> u32 {
     }
 }
 
-impl<D: BlockAccess> DirectoryAccess for FileSystem<D> {
-    type DirectoryHandle = BasicDirectoryHandle;
-}
-
 pub trait FileAccess: DirectoryAccess {
     type FileHandle: FileHandle + From<FileInfo>;
 
@@ -614,10 +552,6 @@ pub trait FileAccess: DirectoryAccess {
         }
         Ok(read)
     }
-}
-
-impl<D: BlockAccess> FileAccess for FileSystem<D> {
-    type FileHandle = BasicFileHandle;
 }
 
 pub trait AllocationAccess: ChainAccess + BlockWrite {
@@ -853,5 +787,3 @@ pub trait AllocationAccess: ChainAccess + BlockWrite {
         Err(Error::CorruptChain)
     }
 }
-
-impl<D: BlockWrite> AllocationAccess for FileSystem<D> {}
