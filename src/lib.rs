@@ -14,6 +14,7 @@
 pub mod access;
 pub mod format;
 pub mod handle;
+pub mod mbr;
 pub mod volume;
 pub mod write;
 
@@ -32,6 +33,13 @@ pub use format::FatType;
 pub use handle::{
     BasicDirectoryHandle, BasicFileHandle, DirectoryEntryLocation, DirectoryHandle, DirectoryInfo,
     DirectoryLocation, FileHandle, FileInfo, MutableFileHandle,
+};
+#[cfg(feature = "sync")]
+pub use mbr::read_mbr;
+#[cfg(feature = "async")]
+pub use mbr::read_mbr_async;
+pub use mbr::{
+    MBR_PARTITION_COUNT, MbrError, MbrFormatError, MbrPartitionEntry, MbrPartitionTable,
 };
 pub use volume::{Cluster, Volume};
 pub use write::FreeDirectoryEntries;

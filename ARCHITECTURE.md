@@ -22,6 +22,7 @@
   - `AllocationAccess`: 空きクラスタ検索、リンク、解放
   - `FatFs`: 上記機能をまとめるmarker trait
 - `handle`: default実装が扱う、ファイルとディレクトリの最小メタデータ
+- `mbr`: MBRのprimary partition table読み出し
 - `write`: directory entry更新、ファイル/ディレクトリ作成・削除・rename、任意位置書き込み、伸縮
 
 `access`と`write`はasync形式を原本とし、`maybe-async-cfg`で同期版と非同期版を生成する。format、volume、handle、errorは両APIで共有する。
