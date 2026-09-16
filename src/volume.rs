@@ -1,16 +1,21 @@
+//! Validated FAT volume geometry.
+
 use crate::{
     format::{Bpb, FormatError},
     handle::DirectoryLocation,
 };
 
+/// A valid data-cluster number.
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
 pub struct Cluster(u32);
 
 impl Cluster {
+    /// Creates a cluster number when `value` is at least two.
     pub const fn new(value: u32) -> Option<Self> {
         if value >= 2 { Some(Self(value)) } else { None }
     }
 
+    /// Returns the raw cluster number.
     pub const fn get(self) -> u32 {
         self.0
     }
@@ -18,18 +23,27 @@ impl Cluster {
 
 pub use crate::format::FatType;
 
+/// Geometry and FAT metadata derived from a validated BPB.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct Volume {
+    /// Parsed BIOS Parameter Block.
     pub bpb: Bpb,
+    /// FAT variant selected from the cluster count.
     pub fat_type: FatType,
+    /// First sector of the first FAT.
     pub fat_start_sector: u32,
+    /// First sector of the FAT12/16 fixed root directory.
     pub root_directory_start_sector: u32,
+    /// Size of the FAT12/16 fixed root directory in sectors.
     pub root_directory_sectors: u32,
+    /// First sector of the cluster data area.
     pub data_start_sector: u32,
+    /// Number of data clusters.
     pub cluster_count: u32,
 }
 
 impl Volume {
+    /// Validates a BPB and derives volume geometry.
     pub fn from_bpb(bpb: Bpb) -> Result<Self, FormatError> {
         let fat_sectors = if bpb.sectors_per_fat_16 != 0 {
             bpb.sectors_per_fat_16 as u32
@@ -107,14 +121,17 @@ impl Volume {
         })
     }
 
+    /// Returns the logical sector size in bytes.
     pub const fn sector_size(&self) -> usize {
         self.bpb.bytes_per_sector as usize
     }
 
+    /// Returns the cluster size in bytes.
     pub const fn cluster_size(&self) -> usize {
         self.sector_size() * self.bpb.sectors_per_cluster as usize
     }
 
+    /// Returns the size of one FAT in sectors.
     pub const fn fat_sectors(&self) -> u32 {
         if self.bpb.sectors_per_fat_16 != 0 {
             self.bpb.sectors_per_fat_16 as u32
@@ -123,14 +140,17 @@ impl Volume {
         }
     }
 
+    /// Returns the highest valid data-cluster number.
     pub const fn max_cluster(&self) -> u32 {
         self.cluster_count + 1
     }
 
+    /// Converts a sector number to a byte offset.
     pub const fn sector_byte_offset(&self, sector: u32) -> u64 {
         sector as u64 * self.bpb.bytes_per_sector as u64
     }
 
+    /// Converts a data cluster to its byte offset.
     pub fn cluster_byte_offset(&self, cluster: Cluster) -> Option<u64> {
         let index = cluster.get().checked_sub(2)?;
         (index < self.cluster_count).then(|| {
@@ -140,6 +160,7 @@ impl Volume {
         })
     }
 
+    /// Returns the root directory location.
     pub fn root_directory(&self) -> DirectoryLocation {
         match self.fat_type {
             FatType::Fat32 => DirectoryLocation::Cluster(
@@ -149,10 +170,12 @@ impl Volume {
         }
     }
 
+    /// Returns whether writes must be mirrored to every FAT copy.
     pub fn fat_mirroring_enabled(&self) -> bool {
         self.fat_type != FatType::Fat32 || self.bpb.extended_flags & 0x80 == 0
     }
 
+    /// Returns the FAT copy used for reads.
     pub fn active_fat(&self) -> u8 {
         if self.fat_mirroring_enabled() {
             0

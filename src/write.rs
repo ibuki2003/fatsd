@@ -1,3 +1,5 @@
+//! Directory and file mutation traits.
+
 use core::cmp;
 
 use crate::{
@@ -10,13 +12,18 @@ use crate::{
     volume::Cluster,
 };
 
+/// A contiguous run of reusable directory entries.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct FreeDirectoryEntries {
+    /// Index of the first reusable entry.
     pub start_index: u32,
+    /// Whether the run reaches the directory end marker.
     pub reached_end: bool,
 }
 
+/// Provides directory creation, removal, and renaming.
 pub trait DirectoryWrite: DirectoryAccess + AllocationAccess {
+    /// Writes bytes at an offset within a directory.
     fn write_directory_at(
         &mut self,
         directory: DirectoryLocation,
@@ -53,6 +60,7 @@ pub trait DirectoryWrite: DirectoryAccess + AllocationAccess {
         }
     }
 
+    /// Writes one directory entry at a known location.
     fn write_directory_entry(
         &mut self,
         location: DirectoryEntryLocation,
@@ -65,6 +73,7 @@ pub trait DirectoryWrite: DirectoryAccess + AllocationAccess {
         )
     }
 
+    /// Reads one directory entry at a known location.
     fn read_directory_entry_at(
         &mut self,
         location: DirectoryEntryLocation,
@@ -77,6 +86,7 @@ pub trait DirectoryWrite: DirectoryAccess + AllocationAccess {
             .ok_or(Error::NotFound)
     }
 
+    /// Finds a contiguous run of reusable directory entries.
     fn find_free_directory_entries(
         &mut self,
         directory: &Self::DirectoryHandle,
@@ -122,6 +132,7 @@ pub trait DirectoryWrite: DirectoryAccess + AllocationAccess {
         }
     }
 
+    /// Checks whether a directory can hold the requested entry range.
     fn check_directory_capacity(
         &self,
         directory: &Self::DirectoryHandle,
@@ -138,6 +149,7 @@ pub trait DirectoryWrite: DirectoryAccess + AllocationAccess {
         Ok(())
     }
 
+    /// Returns whether a short name is already present.
     fn short_name_exists(
         &mut self,
         directory: &Self::DirectoryHandle,
@@ -155,6 +167,7 @@ pub trait DirectoryWrite: DirectoryAccess + AllocationAccess {
         }
     }
 
+    /// Creates a raw entry and its long-name entries for a path.
     fn create_named_entry(
         &mut self,
         path: &str,
@@ -225,6 +238,7 @@ pub trait DirectoryWrite: DirectoryAccess + AllocationAccess {
         })
     }
 
+    /// Creates an empty file.
     fn create_file(&mut self, path: &str) -> Result<Self::FileHandle, Error<Self::Error>>
     where
         Self: FileAccess,
@@ -242,6 +256,7 @@ pub trait DirectoryWrite: DirectoryAccess + AllocationAccess {
         .into())
     }
 
+    /// Creates an empty directory including its dot entries.
     fn create_directory(
         &mut self,
         path: &str,
@@ -281,6 +296,7 @@ pub trait DirectoryWrite: DirectoryAccess + AllocationAccess {
         .into())
     }
 
+    /// Marks an entry and its associated long-name entries as deleted.
     fn delete_found_entry(&mut self, found: FoundEntry) -> Result<(), Error<Self::Error>> {
         let start = found.lfn_start_index.unwrap_or(found.location.index);
         for index in (start..=found.location.index).rev() {
@@ -295,6 +311,7 @@ pub trait DirectoryWrite: DirectoryAccess + AllocationAccess {
         Ok(())
     }
 
+    /// Removes a file and releases its cluster chain.
     fn remove_file(&mut self, path: &str) -> Result<(), Error<Self::Error>> {
         let found = self.find_entry_by_path(path)?;
         if found.raw.is_directory() || found.raw.is_volume_label() {
@@ -311,6 +328,7 @@ pub trait DirectoryWrite: DirectoryAccess + AllocationAccess {
         Ok(())
     }
 
+    /// Returns whether a directory contains no entries other than dot entries.
     fn directory_is_empty(
         &mut self,
         directory: &Self::DirectoryHandle,
@@ -332,6 +350,7 @@ pub trait DirectoryWrite: DirectoryAccess + AllocationAccess {
         }
     }
 
+    /// Removes an empty directory and releases its cluster chain.
     fn remove_directory(&mut self, path: &str) -> Result<(), Error<Self::Error>> {
         let found = self.find_entry_by_path(path)?;
         if !found.raw.is_directory() {
@@ -350,6 +369,7 @@ pub trait DirectoryWrite: DirectoryAccess + AllocationAccess {
         self.free_chain(cluster)
     }
 
+    /// Renames or moves an entry.
     fn rename(&mut self, source: &str, destination: &str) -> Result<(), Error<Self::Error>> {
         let source = self.find_entry_by_path(source)?;
         let (destination_parent, destination_name) = self.open_parent_directory(destination)?;
@@ -390,6 +410,7 @@ pub trait DirectoryWrite: DirectoryAccess + AllocationAccess {
         self.delete_found_entry(source)
     }
 
+    /// Returns whether `directory` is inside `ancestor`.
     fn directory_contains(
         &mut self,
         ancestor: DirectoryLocation,
@@ -415,6 +436,7 @@ pub trait DirectoryWrite: DirectoryAccess + AllocationAccess {
         Err(Error::CorruptChain)
     }
 
+    /// Splits a path into its parent directory and final component.
     fn open_parent_directory<'a>(
         &mut self,
         path: &'a str,
@@ -433,6 +455,7 @@ pub trait DirectoryWrite: DirectoryAccess + AllocationAccess {
         Ok((directory, name))
     }
 
+    /// Selects an unused short name and reports whether an LFN is required.
     fn select_short_name(
         &mut self,
         directory: &Self::DirectoryHandle,
@@ -453,12 +476,15 @@ pub trait DirectoryWrite: DirectoryAccess + AllocationAccess {
     }
 }
 
+/// Provides file data writes and truncation.
 pub trait FileWrite: FileAccess + DirectoryWrite
 where
     Self::FileHandle: MutableFileHandle,
 {
+    /// Called after a file's cluster chain changes.
     fn file_chain_changed(&mut self, _file: &mut Self::FileHandle) {}
 
+    /// Persists a handle's cluster and length fields to its directory entry.
     fn persist_file_info(&mut self, file: &Self::FileHandle) -> Result<(), Error<Self::Error>> {
         let info = *file.file_info();
         let mut entry = self.read_directory_entry_at(info.entry)?;
@@ -467,6 +493,7 @@ where
         self.write_directory_entry(info.entry, entry)
     }
 
+    /// Writes within an already allocated file chain.
     fn write_file_data_at(
         &mut self,
         file: &mut Self::FileHandle,
@@ -507,6 +534,7 @@ where
         Ok(())
     }
 
+    /// Writes zeroes within an already allocated file chain.
     fn write_zeros(
         &mut self,
         file: &mut Self::FileHandle,
@@ -523,6 +551,7 @@ where
         Ok(())
     }
 
+    /// Writes file data at an absolute file offset, extending as needed.
     fn write_file_at(
         &mut self,
         file: &mut Self::FileHandle,
@@ -562,6 +591,7 @@ where
         Ok(data.len())
     }
 
+    /// Changes a file's length, allocating or releasing clusters as needed.
     fn truncate_file(
         &mut self,
         file: &mut Self::FileHandle,
@@ -604,6 +634,7 @@ where
     }
 }
 
+/// Marker for filesystem types providing all read and write capabilities.
 pub trait FatFs: FileWrite
 where
     Self::FileHandle: MutableFileHandle,

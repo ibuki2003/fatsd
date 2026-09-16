@@ -2,40 +2,67 @@
 
 use core::fmt;
 
+/// Size of an on-disk directory entry in bytes.
 pub const DIRECTORY_ENTRY_SIZE: usize = 32;
 
+/// An error while parsing or serializing an on-disk value.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum FormatError {
+    /// The supplied byte buffer is too small.
     BufferTooSmall,
+    /// The boot-sector signature is missing.
     InvalidBootSignature,
+    /// The sector size is not supported by FAT.
     InvalidBytesPerSector,
+    /// The sectors-per-cluster value is invalid.
     InvalidSectorsPerCluster,
+    /// BPB fields are inconsistent.
     InvalidBpb,
+    /// A directory entry is malformed.
     InvalidDirectoryEntry,
+    /// A FAT entry cannot be represented.
     InvalidFatEntry,
 }
 
+/// BIOS Parameter Block fields used by FAT12, FAT16, and FAT32.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct Bpb {
+    /// Logical sector size in bytes.
     pub bytes_per_sector: u16,
+    /// Logical sectors in one cluster.
     pub sectors_per_cluster: u8,
+    /// Sectors preceding the first FAT.
     pub reserved_sector_count: u16,
+    /// Number of FAT copies.
     pub fat_count: u8,
+    /// Capacity of the fixed FAT12/16 root directory.
     pub root_entry_count: u16,
+    /// Total logical sectors in the volume.
     pub total_sectors: u32,
+    /// Media descriptor byte.
     pub media: u8,
+    /// FAT size for FAT12/16, or zero for FAT32.
     pub sectors_per_fat_16: u16,
+    /// Geometry sectors per track.
     pub sectors_per_track: u16,
+    /// Geometry head count.
     pub head_count: u16,
+    /// Sectors preceding the volume.
     pub hidden_sectors: u32,
+    /// FAT size for FAT32.
     pub sectors_per_fat_32: u32,
+    /// FAT32 mirroring and active-FAT flags.
     pub extended_flags: u16,
+    /// First cluster of the FAT32 root directory.
     pub root_cluster: u32,
+    /// FAT32 FSInfo sector number.
     pub fs_info_sector: u16,
+    /// FAT32 backup boot-sector number.
     pub backup_boot_sector: u16,
 }
 
 impl Bpb {
+    /// Parses a BPB from a boot-sector image.
     pub fn parse(bytes: &[u8]) -> Result<Self, FormatError> {
         if bytes.len() < 512 {
             return Err(FormatError::BufferTooSmall);
@@ -121,16 +148,23 @@ impl Bpb {
     }
 }
 
+/// A raw 32-byte directory entry.
 #[derive(Clone, Copy, Eq, PartialEq)]
 pub struct RawDirEntry(pub [u8; DIRECTORY_ENTRY_SIZE]);
 
 impl RawDirEntry {
+    /// Read-only attribute bit.
     pub const ATTR_READ_ONLY: u8 = 0x01;
+    /// Volume-label attribute bit.
     pub const ATTR_VOLUME_ID: u8 = 0x08;
+    /// Directory attribute bit.
     pub const ATTR_DIRECTORY: u8 = 0x10;
+    /// Archive attribute bit.
     pub const ATTR_ARCHIVE: u8 = 0x20;
+    /// Attribute value identifying a long-name entry.
     pub const ATTR_LONG_NAME: u8 = 0x0f;
 
+    /// Parses one raw directory entry.
     pub fn parse(bytes: &[u8]) -> Result<Self, FormatError> {
         let data = bytes
             .get(..DIRECTORY_ENTRY_SIZE)
@@ -140,54 +174,67 @@ impl RawDirEntry {
         Ok(Self(data))
     }
 
+    /// Returns the serialized directory entry.
     pub const fn serialize(self) -> [u8; DIRECTORY_ENTRY_SIZE] {
         self.0
     }
 
+    /// Returns whether this entry terminates the directory.
     pub const fn is_end(&self) -> bool {
         self.0[0] == 0
     }
 
+    /// Returns whether this entry has been deleted.
     pub const fn is_deleted(&self) -> bool {
         self.0[0] == 0xe5
     }
 
+    /// Returns the attribute byte.
     pub const fn attributes(&self) -> u8 {
         self.0[11]
     }
 
+    /// Returns whether this is a long-name entry.
     pub const fn is_lfn(&self) -> bool {
         self.attributes() == Self::ATTR_LONG_NAME
     }
 
+    /// Returns whether this entry names a directory.
     pub const fn is_directory(&self) -> bool {
         self.attributes() & Self::ATTR_DIRECTORY != 0
     }
 
+    /// Returns whether this entry is a volume label.
     pub const fn is_volume_label(&self) -> bool {
         self.attributes() & Self::ATTR_VOLUME_ID != 0
     }
 
+    /// Returns the raw 8.3 short name.
     pub fn short_name(&self) -> ShortName {
         ShortName(self.0[..11].try_into().expect("fixed slice length"))
     }
 
+    /// Returns the high word of the first cluster.
     pub fn first_cluster_high(&self) -> u16 {
         le16(&self.0, 20)
     }
 
+    /// Returns the low word of the first cluster.
     pub fn first_cluster_low(&self) -> u16 {
         le16(&self.0, 26)
     }
 
+    /// Returns the combined first-cluster value.
     pub fn first_cluster(&self) -> u32 {
         ((self.first_cluster_high() as u32) << 16) | self.first_cluster_low() as u32
     }
 
+    /// Returns the file size in bytes.
     pub fn file_size(&self) -> u32 {
         le32(&self.0, 28)
     }
 
+    /// Creates an entry with a short name and attributes.
     pub fn new(name: ShortName, attributes: u8) -> Self {
         let mut raw = [0; DIRECTORY_ENTRY_SIZE];
         raw[..11].copy_from_slice(&name.0);
@@ -195,10 +242,12 @@ impl RawDirEntry {
         Self(raw)
     }
 
+    /// Replaces the short name.
     pub fn set_short_name(&mut self, name: ShortName) {
         self.0[..11].copy_from_slice(&name.0);
     }
 
+    /// Sets the first cluster, preserving FAT32 reserved bits.
     pub fn set_first_cluster(&mut self, fat_type: FatType, cluster: Option<u32>) {
         let cluster = cluster.unwrap_or(0);
         let high = if fat_type == FatType::Fat32 {
@@ -210,6 +259,7 @@ impl RawDirEntry {
         put16(&mut self.0, 26, cluster as u16);
     }
 
+    /// Sets the file size in bytes.
     pub fn set_file_size(&mut self, size: u32) {
         put32(&mut self.0, 28, size);
     }
@@ -221,15 +271,21 @@ impl fmt::Debug for RawDirEntry {
     }
 }
 
+/// Decoded contents of one long-name directory entry.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct LfnEntry {
+    /// One-based position in the long-name sequence.
     pub ordinal: u8,
+    /// Whether this is the first on-disk entry in the sequence.
     pub is_last: bool,
+    /// Checksum of the associated short name.
     pub checksum: u8,
+    /// UTF-16 code units stored in this entry.
     pub characters: [u16; 13],
 }
 
 impl LfnEntry {
+    /// Parses a long-name entry.
     pub fn parse(raw: RawDirEntry) -> Result<Self, FormatError> {
         if !raw.is_lfn()
             || raw.0[0] & 0x1f == 0
@@ -251,6 +307,7 @@ impl LfnEntry {
         })
     }
 
+    /// Serializes a long-name entry.
     pub fn serialize(self) -> Result<RawDirEntry, FormatError> {
         if self.ordinal == 0 || self.ordinal > 20 {
             return Err(FormatError::InvalidDirectoryEntry);
@@ -270,16 +327,19 @@ impl LfnEntry {
 
 const LFN_CHARACTER_OFFSETS: [usize; 13] = [1, 3, 5, 7, 9, 14, 16, 18, 20, 22, 24, 28, 30];
 
+/// An on-disk, space-padded 8.3 name.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct ShortName(pub [u8; 11]);
 
 impl ShortName {
+    /// Computes the checksum used by long-name entries.
     pub fn checksum(self) -> u8 {
         self.0
             .into_iter()
             .fold(0u8, |sum, byte| sum.rotate_right(1).wrapping_add(byte))
     }
 
+    /// Compares this name with an ASCII path component.
     pub fn matches(&self, name: &str) -> bool {
         if matches!(name, "." | "..") {
             return component_matches(&self.0[..8], name)
@@ -290,23 +350,34 @@ impl ShortName {
     }
 }
 
+/// FAT variant determined from the cluster count.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum FatType {
+    /// 12-bit FAT entries.
     Fat12,
+    /// 16-bit FAT entries.
     Fat16,
+    /// 28-bit FAT entries stored in 32-bit words.
     Fat32,
 }
 
+/// Decoded state of a FAT entry.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum FatEntry {
+    /// An unallocated cluster.
     Free,
+    /// Link to the next cluster.
     Data(u32),
+    /// A cluster marked as defective.
     Bad,
+    /// The last cluster in a chain.
     EndOfChain,
+    /// A reserved marker value.
     Reserved(u32),
 }
 
 impl FatEntry {
+    /// Parses a FAT entry from its containing bytes.
     pub fn parse(fat_type: FatType, cluster: u32, bytes: &[u8]) -> Result<Self, FormatError> {
         let value = match fat_type {
             FatType::Fat12 => {

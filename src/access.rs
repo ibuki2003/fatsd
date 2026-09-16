@@ -1,3 +1,5 @@
+//! Block, cluster-chain, directory, file, and allocation access traits.
+
 use core::cmp;
 
 use crate::{
@@ -9,22 +11,38 @@ use crate::{
     volume::{Cluster, Volume},
 };
 
+/// An error produced while accessing a FAT volume.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum Error<E> {
+    /// The underlying block device returned an error.
     Io(E),
+    /// On-disk data is not a valid FAT representation.
     InvalidFormat(FormatError),
+    /// A cluster chain is inconsistent.
     CorruptChain,
+    /// The requested entry does not exist.
     NotFound,
+    /// The requested entry is not a file.
     NotAFile,
+    /// The requested entry is not a directory.
     NotADirectory,
+    /// The path cannot identify an entry.
     InvalidPath,
+    /// No free cluster is available.
     NoSpace,
+    /// An entry with the requested name already exists.
     AlreadyExists,
+    /// The directory cannot hold another entry.
     DirectoryFull,
+    /// The requested name exceeds the FAT limit.
     NameTooLong,
+    /// The requested name is not valid for FAT.
     InvalidName,
+    /// The directory still contains entries.
     NotEmpty,
+    /// The entry is marked read-only.
     ReadOnly,
+    /// An offset or length is outside the supported range.
     OutOfBounds,
 }
 
@@ -34,9 +52,12 @@ impl<E> From<FormatError> for Error<E> {
     }
 }
 
+/// Provides partial reads from fixed-size physical blocks.
 pub trait BlockAccess {
+    /// Error returned by the block device.
     type Error;
 
+    /// Returns the physical block size in bytes.
     fn block_size(&self) -> usize;
 
     /// Reads a range contained in one physical block.
@@ -50,6 +71,7 @@ pub trait BlockAccess {
     ) -> Result<(), Self::Error>;
 }
 
+/// Provides partial writes to fixed-size physical blocks.
 pub trait BlockWrite: BlockAccess {
     /// Writes a range contained in one physical block.
     ///
@@ -136,15 +158,19 @@ fn write_device_at<T: BlockWrite + ?Sized>(
     Ok(())
 }
 
+/// Reads and validates the volume metadata from a block device.
 pub fn read_volume<T: BlockAccess + ?Sized>(device: &mut T) -> Result<Volume, Error<T::Error>> {
     let mut boot_sector = [0; 512];
     read_device_at(device, 0, &mut boot_sector)?;
     Ok(Volume::from_bpb(Bpb::parse(&boot_sector)?)?)
 }
 
+/// Provides FAT cluster-chain access.
 pub trait ChainAccess: BlockAccess {
+    /// Returns the mounted volume metadata.
     fn volume(&self) -> &Volume;
 
+    /// Reads bytes at an absolute volume offset.
     fn read_volume_at(
         &mut self,
         byte_offset: u64,
@@ -153,6 +179,7 @@ pub trait ChainAccess: BlockAccess {
         read_device_at(self, byte_offset, out)
     }
 
+    /// Reads the FAT entry for a cluster.
     fn read_fat_entry(&mut self, cluster: Cluster) -> Result<FatEntry, Error<Self::Error>> {
         validate_cluster(self.volume(), cluster)?;
         let volume = *self.volume();
@@ -179,6 +206,7 @@ pub trait ChainAccess: BlockAccess {
         }
     }
 
+    /// Returns the next cluster, or `None` at the end of the chain.
     fn next_cluster(&mut self, cluster: Cluster) -> Result<Option<Cluster>, Error<Self::Error>> {
         match self.read_fat_entry(cluster)? {
             FatEntry::Data(next) => {
@@ -208,6 +236,7 @@ pub trait ChainAccess: BlockAccess {
         Ok(Some(cluster))
     }
 
+    /// Reads bytes at an offset within a cluster chain.
     fn read_chain_at(
         &mut self,
         first: Cluster,
@@ -257,16 +286,23 @@ fn validate_cluster<E>(volume: &Volume, cluster: Cluster) -> Result<(), Error<E>
     }
 }
 
+/// A directory entry together with its on-disk location.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct FoundEntry {
+    /// Raw short directory entry.
     pub raw: RawDirEntry,
+    /// Location of the short directory entry.
     pub location: DirectoryEntryLocation,
+    /// Index of the first associated long-name entry, if any.
     pub lfn_start_index: Option<u32>,
 }
 
+/// Provides directory traversal and lookup.
 pub trait DirectoryAccess: ChainAccess {
+    /// Application-owned directory handle type.
     type DirectoryHandle: DirectoryHandle + From<DirectoryInfo>;
 
+    /// Returns a handle for the root directory.
     fn root_directory(&self) -> Self::DirectoryHandle {
         DirectoryInfo {
             location: self.volume().root_directory(),
@@ -274,6 +310,7 @@ pub trait DirectoryAccess: ChainAccess {
         .into()
     }
 
+    /// Reads bytes at an offset within a directory.
     fn read_directory_at(
         &mut self,
         directory: &Self::DirectoryHandle,
@@ -296,6 +333,7 @@ pub trait DirectoryAccess: ChainAccess {
         }
     }
 
+    /// Reads a directory entry by index.
     fn read_directory_entry(
         &mut self,
         directory: &Self::DirectoryHandle,
@@ -310,6 +348,7 @@ pub trait DirectoryAccess: ChainAccess {
         Ok((!entry.is_end()).then_some(entry))
     }
 
+    /// Finds a named entry directly inside a directory.
     fn find_entry(
         &mut self,
         directory: &Self::DirectoryHandle,
@@ -398,6 +437,7 @@ pub trait DirectoryAccess: ChainAccess {
         }
     }
 
+    /// Finds an entry by path from the root directory.
     fn find_entry_by_path(&mut self, path: &str) -> Result<FoundEntry, Error<Self::Error>> {
         let mut components = path
             .split('/')
@@ -418,6 +458,7 @@ pub trait DirectoryAccess: ChainAccess {
         Ok(entry)
     }
 
+    /// Opens a directory by path from the root directory.
     fn open_directory(&mut self, path: &str) -> Result<Self::DirectoryHandle, Error<Self::Error>> {
         if path.split('/').all(|part| part.is_empty() || part == ".") {
             return Ok(self.root_directory());
@@ -466,9 +507,12 @@ fn entry_first_cluster(volume: &Volume, entry: &RawDirEntry) -> u32 {
     }
 }
 
+/// Provides file lookup and reading.
 pub trait FileAccess: DirectoryAccess {
+    /// Application-owned file handle type.
     type FileHandle: FileHandle + From<FileInfo>;
 
+    /// Opens a file by path from the root directory.
     fn open_file(&mut self, path: &str) -> Result<Self::FileHandle, Error<Self::Error>> {
         let entry = self.find_entry_by_path(path)?;
         if entry.raw.is_directory() || entry.raw.is_volume_label() {
@@ -511,6 +555,7 @@ pub trait FileAccess: DirectoryAccess {
         self.next_cluster(current)
     }
 
+    /// Reads file data at an absolute file offset.
     fn read_file_at(
         &mut self,
         file: &mut Self::FileHandle,
@@ -554,11 +599,14 @@ pub trait FileAccess: DirectoryAccess {
     }
 }
 
+/// Provides cluster allocation and chain mutation.
 pub trait AllocationAccess: ChainAccess + BlockWrite {
+    /// Writes bytes at an absolute volume offset.
     fn write_volume_at(&mut self, byte_offset: u64, data: &[u8]) -> Result<(), Error<Self::Error>> {
         write_device_at(self, byte_offset, data)
     }
 
+    /// Writes a FAT entry to every active FAT copy.
     fn write_fat_entry(
         &mut self,
         cluster: Cluster,
@@ -585,6 +633,7 @@ pub trait AllocationAccess: ChainAccess + BlockWrite {
         Ok(())
     }
 
+    /// Invalidates free-space hints in a FAT32 FSInfo sector.
     fn invalidate_fs_info(&mut self) -> Result<(), Error<Self::Error>> {
         let volume = *self.volume();
         let sector = volume.bpb.fs_info_sector;
@@ -599,6 +648,7 @@ pub trait AllocationAccess: ChainAccess + BlockWrite {
         Ok(())
     }
 
+    /// Writes an entry to one FAT copy.
     fn write_one_fat_entry(
         &mut self,
         fat_start: u64,
@@ -630,6 +680,7 @@ pub trait AllocationAccess: ChainAccess + BlockWrite {
         }
     }
 
+    /// Finds a free cluster, beginning after an optional hint.
     fn find_free_cluster(&mut self, start: Option<Cluster>) -> Result<Cluster, Error<Self::Error>> {
         let max = self.volume().max_cluster();
         let start = start.map_or(2, Cluster::get);
@@ -645,6 +696,7 @@ pub trait AllocationAccess: ChainAccess + BlockWrite {
         Err(Error::NoSpace)
     }
 
+    /// Allocates and clears a cluster, optionally appending it to a chain.
     fn allocate_cluster(&mut self, after: Option<Cluster>) -> Result<Cluster, Error<Self::Error>> {
         if let Some(previous) = after
             && self.read_fat_entry(previous)? != FatEntry::EndOfChain
@@ -660,6 +712,7 @@ pub trait AllocationAccess: ChainAccess + BlockWrite {
         Ok(cluster)
     }
 
+    /// Fills a cluster with zeroes.
     fn clear_cluster(&mut self, cluster: Cluster) -> Result<(), Error<Self::Error>> {
         let start = self
             .volume()
@@ -675,6 +728,7 @@ pub trait AllocationAccess: ChainAccess + BlockWrite {
         Ok(())
     }
 
+    /// Returns the tail and length of a cluster chain.
     fn chain_tail_and_length(
         &mut self,
         first: Cluster,
@@ -689,6 +743,7 @@ pub trait AllocationAccess: ChainAccess + BlockWrite {
         Err(Error::CorruptChain)
     }
 
+    /// Extends a chain to contain at least `required` clusters.
     fn ensure_chain_length(
         &mut self,
         first: &mut Option<Cluster>,
@@ -711,6 +766,7 @@ pub trait AllocationAccess: ChainAccess + BlockWrite {
         Ok(())
     }
 
+    /// Truncates a chain and returns its retained first cluster.
     fn truncate_chain(
         &mut self,
         first: Option<Cluster>,
@@ -734,6 +790,7 @@ pub trait AllocationAccess: ChainAccess + BlockWrite {
         Ok(Some(first))
     }
 
+    /// Writes bytes at an offset within an existing cluster chain.
     fn write_chain_at(
         &mut self,
         first: Cluster,
@@ -774,6 +831,7 @@ pub trait AllocationAccess: ChainAccess + BlockWrite {
         Ok(written)
     }
 
+    /// Releases every cluster in a chain.
     fn free_chain(&mut self, first: Cluster) -> Result<(), Error<Self::Error>> {
         let mut current = first;
         for _ in 0..self.volume().cluster_count {

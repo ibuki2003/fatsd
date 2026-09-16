@@ -1,4 +1,10 @@
+//! Extensible, allocation-free access to FAT12, FAT16, and FAT32 volumes.
+//!
+//! Filesystem behavior is provided as trait default methods. Applications own the filesystem
+//! type and explicitly implement the capability traits they need.
+
 #![no_std]
+#![warn(missing_docs)]
 
 pub mod access;
 pub mod format;
