@@ -15,7 +15,7 @@
 - `volume`: BPBから導出されるFAT種別と領域配置
 - `access`
   - `BlockAccess`: 物理block I/O。キャッシュを挟む最下層の境界
-  - `ChainAccess`: FATエントリとクラスタチェイン。`cluster_at`を上書きするとCLMT等を利用可能
+  - `ChainAccess`: FATエントリとクラスタチェイン。`cluster_at`がチェイン解決の差し替え境界
   - `DirectoryAccess`: ディレクトリエントリ走査とパス解決
   - `FileAccess`: ファイルハンドル生成と任意位置読み出し
   - `AllocationAccess`: 空きクラスタ検索、リンク、解放
@@ -85,7 +85,7 @@ pub trait ChainAccess: BlockAccess {
     fn read_fat_entry(&mut self, cluster: Cluster) -> Result<FatEntry>;
     fn next_cluster(&mut self, cluster: Cluster) -> Result<Option<Cluster>>;
 
-    // 汎用チェイン探索。FS全体のチェイン索引を持つ場合の上書き箇所。
+    // 汎用チェイン探索。利用側がチェイン解決方法を差し替えられる。
     fn cluster_at(&mut self, first: Cluster, index: u32)
         -> Result<Option<Cluster>>;
 
@@ -138,7 +138,7 @@ pub trait FileAccess: DirectoryAccess {
     fn open_file(&mut self, path: &str) -> Result<Self::FileHandle>;
 
     // defaultはChainAccess::cluster_atを呼ぶ。
-    // CLMTをFileHandleに持たせる実装はここだけを上書きする。
+    // FileHandle固有の解決状態を使う実装はここを上書きする。
     fn resolve_file_cluster(
         &mut self,
         file: &mut Self::FileHandle,
@@ -146,7 +146,7 @@ pub trait FileAccess: DirectoryAccess {
     ) -> Result<Option<Cluster>>;
 
     // defaultはChainAccess::next_clusterを呼ぶ。
-    // CLMTで連続read中のFAT参照も省く場合は上書きする。
+    // 連続readにも独自の解決方法を使う場合は上書きする。
     fn resolve_next_file_cluster(
         &mut self,
         file: &mut Self::FileHandle,
@@ -164,7 +164,7 @@ pub trait FileAccess: DirectoryAccess {
 }
 ```
 
-CLMTはファイルごとの情報なので、`read_file_at`から直接`read_chain_at`を呼ばない。`resolve_file_cluster`でクラスタを解決してから該当クラスタ内を読む。これにより独自`FileHandle`へ固定長テーブル、外部arenaのキー、動的領域などを追加できる。
+`read_file_at`から直接`read_chain_at`を呼ばず、`resolve_file_cluster`を経由してクラスタを解決する。これにより利用側は独自`FileHandle`の状態を使って解決処理を差し替えられる。
 
 `FileHandle`が要求するviewは次だけにする。
 
@@ -273,9 +273,9 @@ open_file(path)
            -> cluster_at -> read_fat_entry -> read_block_at
 
 read_file_at(handle, offset, out)
-  -> resolve_file_cluster(handle, cluster_index)  // CLMT差し替え点
+  -> resolve_file_cluster(handle, cluster_index)  // handle固有の解決境界
      -> cluster_at -> read_fat_entry              // 既定動作
-  -> resolve_next_file_cluster                    // 連続readのCLMT差し替え点
+  -> resolve_next_file_cluster                    // 連続read時の解決境界
      -> next_cluster -> read_fat_entry             // 既定動作
   -> read_volume_at -> read_block_at              // cache差し替え点
 ```
@@ -283,7 +283,7 @@ read_file_at(handle, offset, out)
 ## 拡張境界
 
 - ブロックキャッシュ: `BlockAccess::read_block_at` / `BlockWrite::write_block_at`の実装内、または同traitを実装するdecorator
-- CLMT: ファイル単位なら`FileAccess::{resolve_file_cluster, resolve_next_file_cluster}`、FS共通なら`ChainAccess::cluster_at`を上書き
+- クラスタ解決: ファイルハンドル固有なら`FileAccess::{resolve_file_cluster, resolve_next_file_cluster}`、FS共通なら`ChainAccess::cluster_at`を上書き
 - 独自ハンドル: `FileAccess::FileHandle` / `DirectoryAccess::DirectoryHandle`の関連型。ハンドルは返り値にのみ現れ、各traitで要求する小さなview traitを実装する
 - `file.read_at()`形式: FSへの`&mut`参照を保持する別wrapperとして追加可能。基本ハンドルはFSを借用せず、複数ハンドルを同時保持できる形を維持
 
@@ -330,9 +330,9 @@ pub enum Error<E> {
 
 `OpenedFile<'a, F> { fs: &'a mut F, handle: F::FileHandle }`を追加すれば`file.read_at()`は実現できる。ただし、その間FS全体が排他的に借用され、同時に別ファイルを開けない。基本APIにはせず、短命な便宜wrapperとして後から追加する。
 
-### CLMTの構築タイミング
+### ハンドル固有の解決状態
 
-defaultの`open_file`は`From<FileInfo>`しか要求しないため、CLMT構築にI/Oは行わない。独自実装は次のどちらかを選べる。
+defaultの`open_file`は`From<FileInfo>`しか要求せず、利用側の追加状態を構築するI/Oは行わない。独自実装は次のどちらかを選べる。
 
 - `resolve_file_cluster`の初回呼び出しでlazy構築
 - `open_file`を上書きし、default相当の検索後にeager構築

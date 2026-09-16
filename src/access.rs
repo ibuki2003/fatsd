@@ -219,7 +219,9 @@ pub trait ChainAccess: BlockAccess {
         }
     }
 
-    /// Resolves a cluster by walking a chain. Override this to use a shared chain index.
+    /// Resolves the cluster at `index` in a chain.
+    ///
+    /// The default implementation walks the FAT chain from `first`.
     fn cluster_at(
         &mut self,
         first: Cluster,
@@ -532,7 +534,9 @@ pub trait FileAccess: DirectoryAccess {
         .into())
     }
 
-    /// Resolves a file cluster. Override this method for per-handle CLMT lookup.
+    /// Resolves the cluster at `index` for a file handle.
+    ///
+    /// The default implementation delegates to [`ChainAccess::cluster_at`].
     fn resolve_file_cluster(
         &mut self,
         file: &mut Self::FileHandle,
@@ -544,8 +548,9 @@ pub trait FileAccess: DirectoryAccess {
         self.cluster_at(first, index)
     }
 
-    /// Resolves the cluster following `current` during a sequential read.
-    /// Override this together with `resolve_file_cluster` to keep all lookups in a CLMT.
+    /// Resolves the cluster following `current` during sequential file access.
+    ///
+    /// The default implementation delegates to [`ChainAccess::next_cluster`].
     fn resolve_next_file_cluster(
         &mut self,
         _file: &mut Self::FileHandle,
