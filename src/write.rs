@@ -3,7 +3,7 @@
 use core::cmp;
 
 use crate::{
-    access::{AllocationAccess, DirectoryAccess, Error, FileAccess, FoundEntry},
+    access::{Error, FoundEntry},
     format::{DIRECTORY_ENTRY_SIZE, FatType, LfnEntry, RawDirEntry, ShortName},
     handle::{
         DirectoryEntryLocation, DirectoryHandle, DirectoryInfo, DirectoryLocation, FileHandle,
@@ -11,6 +11,11 @@ use crate::{
     },
     volume::Cluster,
 };
+
+#[cfg(feature = "sync")]
+use crate::access::{AllocationAccess, DirectoryAccess, FileAccess};
+#[cfg(feature = "async")]
+use crate::access::{AsyncAllocationAccess, AsyncDirectoryAccess, AsyncFileAccess};
 
 /// A contiguous run of reusable directory entries.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -22,9 +27,19 @@ pub struct FreeDirectoryEntries {
 }
 
 /// Provides directory creation, removal, and renaming.
+#[maybe_async_cfg::maybe(
+    idents(
+        AllocationAccess(sync, async = "AsyncAllocationAccess"),
+        DirectoryAccess(sync, async = "AsyncDirectoryAccess"),
+        DirectoryWrite(sync, async = "AsyncDirectoryWrite"),
+        FileAccess(sync, async = "AsyncFileAccess")
+    ),
+    sync(feature = "sync"),
+    async(feature = "async")
+)]
 pub trait DirectoryWrite: DirectoryAccess + AllocationAccess {
     /// Writes bytes at an offset within a directory.
-    fn write_directory_at(
+    async fn write_directory_at(
         &mut self,
         directory: DirectoryLocation,
         offset: u64,
@@ -44,15 +59,15 @@ pub trait DirectoryWrite: DirectoryAccess + AllocationAccess {
                     return Err(Error::DirectoryFull);
                 }
                 let start = volume.sector_byte_offset(volume.root_directory_start_sector) + offset;
-                self.write_volume_at(start, data)
+                self.write_volume_at(start, data).await
             }
             DirectoryLocation::Cluster(first) => {
                 let cluster_size = self.volume().cluster_size() as u64;
                 let required =
                     u32::try_from(end.div_ceil(cluster_size)).map_err(|_| Error::OutOfBounds)?;
                 let mut chain = Some(first);
-                self.ensure_chain_length(&mut chain, required)?;
-                if self.write_chain_at(first, offset, data)? != data.len() {
+                self.ensure_chain_length(&mut chain, required).await?;
+                if self.write_chain_at(first, offset, data).await? != data.len() {
                     return Err(Error::CorruptChain);
                 }
                 Ok(())
@@ -61,7 +76,7 @@ pub trait DirectoryWrite: DirectoryAccess + AllocationAccess {
     }
 
     /// Writes one directory entry at a known location.
-    fn write_directory_entry(
+    async fn write_directory_entry(
         &mut self,
         location: DirectoryEntryLocation,
         entry: RawDirEntry,
@@ -71,10 +86,11 @@ pub trait DirectoryWrite: DirectoryAccess + AllocationAccess {
             location.index as u64 * DIRECTORY_ENTRY_SIZE as u64,
             &entry.serialize(),
         )
+        .await
     }
 
     /// Reads one directory entry at a known location.
-    fn read_directory_entry_at(
+    async fn read_directory_entry_at(
         &mut self,
         location: DirectoryEntryLocation,
     ) -> Result<RawDirEntry, Error<Self::Error>> {
@@ -82,12 +98,13 @@ pub trait DirectoryWrite: DirectoryAccess + AllocationAccess {
             location: location.directory,
         }
         .into();
-        self.read_directory_entry(&directory, location.index)?
+        self.read_directory_entry(&directory, location.index)
+            .await?
             .ok_or(Error::NotFound)
     }
 
     /// Finds a contiguous run of reusable directory entries.
-    fn find_free_directory_entries(
+    async fn find_free_directory_entries(
         &mut self,
         directory: &Self::DirectoryHandle,
         count: u32,
@@ -100,11 +117,13 @@ pub trait DirectoryWrite: DirectoryAccess + AllocationAccess {
         let mut run_length = 0u32;
         loop {
             let mut bytes = [0; DIRECTORY_ENTRY_SIZE];
-            let read = self.read_directory_at(
-                directory,
-                index as u64 * DIRECTORY_ENTRY_SIZE as u64,
-                &mut bytes,
-            )?;
+            let read = self
+                .read_directory_at(
+                    directory,
+                    index as u64 * DIRECTORY_ENTRY_SIZE as u64,
+                    &mut bytes,
+                )
+                .await?;
             let reached_end = read == 0 || bytes[0] == 0;
             if reached_end {
                 let start_index = if run_length == 0 { index } else { run_start };
@@ -150,14 +169,15 @@ pub trait DirectoryWrite: DirectoryAccess + AllocationAccess {
     }
 
     /// Returns whether a short name is already present.
-    fn short_name_exists(
+    async fn short_name_exists(
         &mut self,
         directory: &Self::DirectoryHandle,
         name: ShortName,
     ) -> Result<bool, Error<Self::Error>> {
         let mut index = 0u32;
         loop {
-            let Some(entry) = self.read_directory_entry(directory, index)? else {
+            let entry = self.read_directory_entry(directory, index).await?;
+            let Some(entry) = entry else {
                 return Ok(false);
             };
             if !entry.is_deleted() && !entry.is_lfn() && entry.short_name() == name {
@@ -168,18 +188,18 @@ pub trait DirectoryWrite: DirectoryAccess + AllocationAccess {
     }
 
     /// Creates a raw entry and its long-name entries for a path.
-    fn create_named_entry(
+    async fn create_named_entry(
         &mut self,
         path: &str,
         mut entry: RawDirEntry,
     ) -> Result<FoundEntry, Error<Self::Error>> {
-        let (directory, name) = self.open_parent_directory(path)?;
-        match self.find_entry(&directory, name) {
+        let (directory, name) = self.open_parent_directory(path).await?;
+        match self.find_entry(&directory, name).await {
             Ok(_) => return Err(Error::AlreadyExists),
             Err(Error::NotFound) => {}
             Err(error) => return Err(error),
         }
-        let (short_name, needs_lfn) = self.select_short_name(&directory, name)?;
+        let (short_name, needs_lfn) = self.select_short_name(&directory, name).await?;
         let mut utf16 = [0; 255];
         let utf16_length = encode_name(name, &mut utf16)?;
         let lfn_count = if needs_lfn {
@@ -187,7 +207,9 @@ pub trait DirectoryWrite: DirectoryAccess + AllocationAccess {
         } else {
             0
         };
-        let slots = self.find_free_directory_entries(&directory, (lfn_count + 1) as u32)?;
+        let slots = self
+            .find_free_directory_entries(&directory, (lfn_count + 1) as u32)
+            .await?;
         let checksum = short_name.checksum();
         for disk_index in 0..lfn_count {
             let ordinal = lfn_count - disk_index;
@@ -211,14 +233,15 @@ pub trait DirectoryWrite: DirectoryAccess + AllocationAccess {
                     index: slots.start_index + disk_index as u32,
                 },
                 lfn,
-            )?;
+            )
+            .await?;
         }
         let short_location = DirectoryEntryLocation {
             directory: directory.directory_info().location,
             index: slots.start_index + lfn_count as u32,
         };
         entry.set_short_name(short_name);
-        self.write_directory_entry(short_location, entry)?;
+        self.write_directory_entry(short_location, entry).await?;
         if slots.reached_end {
             let next = short_location.index + 1;
             if self.check_directory_capacity(&directory, next, 1).is_ok() {
@@ -228,7 +251,8 @@ pub trait DirectoryWrite: DirectoryAccess + AllocationAccess {
                         index: next,
                     },
                     RawDirEntry([0; DIRECTORY_ENTRY_SIZE]),
-                )?;
+                )
+                .await?;
             }
         }
         Ok(FoundEntry {
@@ -239,14 +263,16 @@ pub trait DirectoryWrite: DirectoryAccess + AllocationAccess {
     }
 
     /// Creates an empty file.
-    fn create_file(&mut self, path: &str) -> Result<Self::FileHandle, Error<Self::Error>>
+    async fn create_file(&mut self, path: &str) -> Result<Self::FileHandle, Error<Self::Error>>
     where
         Self: FileAccess,
     {
-        let found = self.create_named_entry(
-            path,
-            RawDirEntry::new(ShortName([b' '; 11]), RawDirEntry::ATTR_ARCHIVE),
-        )?;
+        let found = self
+            .create_named_entry(
+                path,
+                RawDirEntry::new(ShortName([b' '; 11]), RawDirEntry::ATTR_ARCHIVE),
+            )
+            .await?;
         Ok(FileInfo {
             first_cluster: None,
             length: 0,
@@ -257,18 +283,18 @@ pub trait DirectoryWrite: DirectoryAccess + AllocationAccess {
     }
 
     /// Creates an empty directory including its dot entries.
-    fn create_directory(
+    async fn create_directory(
         &mut self,
         path: &str,
     ) -> Result<Self::DirectoryHandle, Error<Self::Error>> {
-        let (parent, name) = self.open_parent_directory(path)?;
-        match self.find_entry(&parent, name) {
+        let (parent, name) = self.open_parent_directory(path).await?;
+        match self.find_entry(&parent, name).await {
             Ok(_) => return Err(Error::AlreadyExists),
             Err(Error::NotFound) => {}
             Err(error) => return Err(error),
         }
         let parent_location = parent.directory_info().location;
-        let cluster = self.allocate_cluster(None)?;
+        let cluster = self.allocate_cluster(None).await?;
         let mut dot = RawDirEntry::new(ShortName(*b".          "), RawDirEntry::ATTR_DIRECTORY);
         dot.set_first_cluster(self.volume().fat_type, Some(cluster.get()));
         let mut dot_dot = RawDirEntry::new(ShortName(*b"..         "), RawDirEntry::ATTR_DIRECTORY);
@@ -280,14 +306,14 @@ pub trait DirectoryWrite: DirectoryAccess + AllocationAccess {
         entries[..DIRECTORY_ENTRY_SIZE].copy_from_slice(&dot.serialize());
         entries[DIRECTORY_ENTRY_SIZE..DIRECTORY_ENTRY_SIZE * 2]
             .copy_from_slice(&dot_dot.serialize());
-        if self.write_chain_at(cluster, 0, &entries)? != entries.len() {
+        if self.write_chain_at(cluster, 0, &entries).await? != entries.len() {
             return Err(Error::CorruptChain);
         }
 
         let mut entry = RawDirEntry::new(ShortName([b' '; 11]), RawDirEntry::ATTR_DIRECTORY);
         entry.set_first_cluster(self.volume().fat_type, Some(cluster.get()));
-        if let Err(error) = self.create_named_entry(path, entry) {
-            let _ = self.free_chain(cluster);
+        if let Err(error) = self.create_named_entry(path, entry).await {
+            let _ = self.free_chain(cluster).await;
             return Err(error);
         }
         Ok(DirectoryInfo {
@@ -297,23 +323,23 @@ pub trait DirectoryWrite: DirectoryAccess + AllocationAccess {
     }
 
     /// Marks an entry and its associated long-name entries as deleted.
-    fn delete_found_entry(&mut self, found: FoundEntry) -> Result<(), Error<Self::Error>> {
+    async fn delete_found_entry(&mut self, found: FoundEntry) -> Result<(), Error<Self::Error>> {
         let start = found.lfn_start_index.unwrap_or(found.location.index);
         for index in (start..=found.location.index).rev() {
             let location = DirectoryEntryLocation {
                 directory: found.location.directory,
                 index,
             };
-            let mut entry = self.read_directory_entry_at(location)?;
+            let mut entry = self.read_directory_entry_at(location).await?;
             entry.0[0] = 0xe5;
-            self.write_directory_entry(location, entry)?;
+            self.write_directory_entry(location, entry).await?;
         }
         Ok(())
     }
 
     /// Removes a file and releases its cluster chain.
-    fn remove_file(&mut self, path: &str) -> Result<(), Error<Self::Error>> {
-        let found = self.find_entry_by_path(path)?;
+    async fn remove_file(&mut self, path: &str) -> Result<(), Error<Self::Error>> {
+        let found = self.find_entry_by_path(path).await?;
         if found.raw.is_directory() || found.raw.is_volume_label() {
             return Err(Error::NotAFile);
         }
@@ -321,21 +347,22 @@ pub trait DirectoryWrite: DirectoryAccess + AllocationAccess {
             return Err(Error::ReadOnly);
         }
         let first = Cluster::new(entry_cluster(self.volume(), &found.raw));
-        self.delete_found_entry(found)?;
+        self.delete_found_entry(found).await?;
         if let Some(first) = first {
-            self.free_chain(first)?;
+            self.free_chain(first).await?;
         }
         Ok(())
     }
 
     /// Returns whether a directory contains no entries other than dot entries.
-    fn directory_is_empty(
+    async fn directory_is_empty(
         &mut self,
         directory: &Self::DirectoryHandle,
     ) -> Result<bool, Error<Self::Error>> {
         let mut index = 0u32;
         loop {
-            let Some(entry) = self.read_directory_entry(directory, index)? else {
+            let entry = self.read_directory_entry(directory, index).await?;
+            let Some(entry) = entry else {
                 return Ok(true);
             };
             if !entry.is_deleted()
@@ -351,8 +378,8 @@ pub trait DirectoryWrite: DirectoryAccess + AllocationAccess {
     }
 
     /// Removes an empty directory and releases its cluster chain.
-    fn remove_directory(&mut self, path: &str) -> Result<(), Error<Self::Error>> {
-        let found = self.find_entry_by_path(path)?;
+    async fn remove_directory(&mut self, path: &str) -> Result<(), Error<Self::Error>> {
+        let found = self.find_entry_by_path(path).await?;
         if !found.raw.is_directory() {
             return Err(Error::NotADirectory);
         }
@@ -362,18 +389,19 @@ pub trait DirectoryWrite: DirectoryAccess + AllocationAccess {
             location: DirectoryLocation::Cluster(cluster),
         }
         .into();
-        if !self.directory_is_empty(&directory)? {
+        if !self.directory_is_empty(&directory).await? {
             return Err(Error::NotEmpty);
         }
-        self.delete_found_entry(found)?;
-        self.free_chain(cluster)
+        self.delete_found_entry(found).await?;
+        self.free_chain(cluster).await
     }
 
     /// Renames or moves an entry.
-    fn rename(&mut self, source: &str, destination: &str) -> Result<(), Error<Self::Error>> {
-        let source = self.find_entry_by_path(source)?;
-        let (destination_parent, destination_name) = self.open_parent_directory(destination)?;
-        match self.find_entry(&destination_parent, destination_name) {
+    async fn rename(&mut self, source: &str, destination: &str) -> Result<(), Error<Self::Error>> {
+        let source = self.find_entry_by_path(source).await?;
+        let (destination_parent, destination_name) =
+            self.open_parent_directory(destination).await?;
+        match self.find_entry(&destination_parent, destination_name).await {
             Ok(_) => return Err(Error::AlreadyExists),
             Err(Error::NotFound) => {}
             Err(error) => return Err(error),
@@ -382,15 +410,18 @@ pub trait DirectoryWrite: DirectoryAccess + AllocationAccess {
         if source.raw.is_directory() {
             let source_cluster = Cluster::new(entry_cluster(self.volume(), &source.raw))
                 .ok_or(Error::CorruptChain)?;
-            if self.directory_contains(
-                DirectoryLocation::Cluster(source_cluster),
-                destination_parent.directory_info().location,
-            )? {
+            if self
+                .directory_contains(
+                    DirectoryLocation::Cluster(source_cluster),
+                    destination_parent.directory_info().location,
+                )
+                .await?
+            {
                 return Err(Error::InvalidPath);
             }
         }
 
-        self.create_named_entry(destination, source.raw)?;
+        self.create_named_entry(destination, source.raw).await?;
         if source.raw.is_directory()
             && source.location.directory != destination_parent.directory_info().location
         {
@@ -400,18 +431,19 @@ pub trait DirectoryWrite: DirectoryAccess + AllocationAccess {
                 directory: DirectoryLocation::Cluster(source_cluster),
                 index: 1,
             };
-            let mut dot_dot = self.read_directory_entry_at(dot_dot_location)?;
+            let mut dot_dot = self.read_directory_entry_at(dot_dot_location).await?;
             dot_dot.set_first_cluster(
                 self.volume().fat_type,
                 directory_cluster(self.volume(), destination_parent.directory_info().location),
             );
-            self.write_directory_entry(dot_dot_location, dot_dot)?;
+            self.write_directory_entry(dot_dot_location, dot_dot)
+                .await?;
         }
-        self.delete_found_entry(source)
+        self.delete_found_entry(source).await
     }
 
     /// Returns whether `directory` is inside `ancestor`.
-    fn directory_contains(
+    async fn directory_contains(
         &mut self,
         ancestor: DirectoryLocation,
         mut directory: DirectoryLocation,
@@ -427,7 +459,7 @@ pub trait DirectoryWrite: DirectoryAccess + AllocationAccess {
                 location: directory,
             }
             .into();
-            let parent = self.find_entry(&handle, "..")?;
+            let parent = self.find_entry(&handle, "..").await?;
             directory = match Cluster::new(entry_cluster(self.volume(), &parent.raw)) {
                 Some(cluster) => DirectoryLocation::Cluster(cluster),
                 None => self.volume().root_directory(),
@@ -437,7 +469,7 @@ pub trait DirectoryWrite: DirectoryAccess + AllocationAccess {
     }
 
     /// Splits a path into its parent directory and final component.
-    fn open_parent_directory<'a>(
+    async fn open_parent_directory<'a>(
         &mut self,
         path: &'a str,
     ) -> Result<(Self::DirectoryHandle, &'a str), Error<Self::Error>> {
@@ -450,25 +482,25 @@ pub trait DirectoryWrite: DirectoryAccess + AllocationAccess {
         let directory = if parent.is_empty() {
             self.root_directory()
         } else {
-            self.open_directory(parent)?
+            self.open_directory(parent).await?
         };
         Ok((directory, name))
     }
 
     /// Selects an unused short name and reports whether an LFN is required.
-    fn select_short_name(
+    async fn select_short_name(
         &mut self,
         directory: &Self::DirectoryHandle,
         name: &str,
     ) -> Result<(ShortName, bool), Error<Self::Error>> {
         if let Some(short) = canonical_short_name(name)
-            && !self.short_name_exists(directory, short)?
+            && !self.short_name_exists(directory, short).await?
         {
             return Ok((short, false));
         }
         for ordinal in 1..=999_999 {
             let alias = short_alias(name, ordinal);
-            if !self.short_name_exists(directory, alias)? {
+            if !self.short_name_exists(directory, alias).await? {
                 return Ok((alias, true));
             }
         }
@@ -477,6 +509,17 @@ pub trait DirectoryWrite: DirectoryAccess + AllocationAccess {
 }
 
 /// Provides file data writes and truncation.
+#[maybe_async_cfg::maybe(
+    idents(
+        AllocationAccess(sync, async = "AsyncAllocationAccess"),
+        DirectoryAccess(sync, async = "AsyncDirectoryAccess"),
+        DirectoryWrite(sync, async = "AsyncDirectoryWrite"),
+        FileAccess(sync, async = "AsyncFileAccess"),
+        FileWrite(sync, async = "AsyncFileWrite")
+    ),
+    sync(feature = "sync"),
+    async(feature = "async")
+)]
 pub trait FileWrite: FileAccess + DirectoryWrite
 where
     Self::FileHandle: MutableFileHandle,
@@ -485,16 +528,19 @@ where
     fn file_chain_changed(&mut self, _file: &mut Self::FileHandle) {}
 
     /// Persists a handle's cluster and length fields to its directory entry.
-    fn persist_file_info(&mut self, file: &Self::FileHandle) -> Result<(), Error<Self::Error>> {
+    async fn persist_file_info(
+        &mut self,
+        file: &Self::FileHandle,
+    ) -> Result<(), Error<Self::Error>> {
         let info = *file.file_info();
-        let mut entry = self.read_directory_entry_at(info.entry)?;
+        let mut entry = self.read_directory_entry_at(info.entry).await?;
         entry.set_first_cluster(self.volume().fat_type, info.first_cluster.map(Cluster::get));
         entry.set_file_size(u32::try_from(info.length).map_err(|_| Error::OutOfBounds)?);
-        self.write_directory_entry(info.entry, entry)
+        self.write_directory_entry(info.entry, entry).await
     }
 
     /// Writes within an already allocated file chain.
-    fn write_file_data_at(
+    async fn write_file_data_at(
         &mut self,
         file: &mut Self::FileHandle,
         offset: u64,
@@ -508,7 +554,8 @@ where
             u32::try_from(offset / cluster_size).map_err(|_| Error::OutOfBounds)?;
         let mut within_cluster = (offset % cluster_size) as usize;
         let mut cluster = self
-            .resolve_file_cluster(file, cluster_index)?
+            .resolve_file_cluster(file, cluster_index)
+            .await?
             .ok_or(Error::CorruptChain)?;
         let mut written = 0;
         while written < data.len() {
@@ -521,13 +568,15 @@ where
                 .cluster_byte_offset(cluster)
                 .ok_or(Error::CorruptChain)?
                 + within_cluster as u64;
-            self.write_volume_at(byte_offset, &data[written..written + length])?;
+            self.write_volume_at(byte_offset, &data[written..written + length])
+                .await?;
             written += length;
             within_cluster = 0;
             if written < data.len() {
                 cluster_index = cluster_index.checked_add(1).ok_or(Error::OutOfBounds)?;
                 cluster = self
-                    .resolve_next_file_cluster(file, cluster, cluster_index)?
+                    .resolve_next_file_cluster(file, cluster, cluster_index)
+                    .await?
                     .ok_or(Error::CorruptChain)?;
             }
         }
@@ -535,7 +584,7 @@ where
     }
 
     /// Writes zeroes within an already allocated file chain.
-    fn write_zeros(
+    async fn write_zeros(
         &mut self,
         file: &mut Self::FileHandle,
         mut offset: u64,
@@ -544,7 +593,8 @@ where
         let zeros = [0; 512];
         while length != 0 {
             let part = cmp::min(length, zeros.len() as u64) as usize;
-            self.write_file_data_at(file, offset, &zeros[..part])?;
+            self.write_file_data_at(file, offset, &zeros[..part])
+                .await?;
             offset += part as u64;
             length -= part as u64;
         }
@@ -552,7 +602,7 @@ where
     }
 
     /// Writes file data at an absolute file offset, extending as needed.
-    fn write_file_at(
+    async fn write_file_at(
         &mut self,
         file: &mut Self::FileHandle,
         offset: u64,
@@ -572,27 +622,28 @@ where
         let required = u32::try_from(end.div_ceil(self.volume().cluster_size() as u64))
             .map_err(|_| Error::OutOfBounds)?;
         let mut first = old.first_cluster;
-        self.ensure_chain_length(&mut first, required)?;
+        self.ensure_chain_length(&mut first, required).await?;
         if first != old.first_cluster {
             file.file_info_mut().first_cluster = first;
-            self.persist_file_info(file)?;
+            self.persist_file_info(file).await?;
         }
         if end > old.length {
             self.file_chain_changed(file);
         }
         if offset > old.length {
-            self.write_zeros(file, old.length, offset - old.length)?;
+            self.write_zeros(file, old.length, offset - old.length)
+                .await?;
         }
-        self.write_file_data_at(file, offset, data)?;
+        self.write_file_data_at(file, offset, data).await?;
         if end > old.length {
             file.file_info_mut().length = end;
-            self.persist_file_info(file)?;
+            self.persist_file_info(file).await?;
         }
         Ok(data.len())
     }
 
     /// Changes a file's length, allocating or releasing clusters as needed.
-    fn truncate_file(
+    async fn truncate_file(
         &mut self,
         file: &mut Self::FileHandle,
         new_length: u64,
@@ -612,29 +663,38 @@ where
             u32::try_from(new_length.div_ceil(cluster_size)).map_err(|_| Error::OutOfBounds)?;
         if new_length > old.length {
             let mut first = old.first_cluster;
-            self.ensure_chain_length(&mut first, required)?;
+            self.ensure_chain_length(&mut first, required).await?;
             file.file_info_mut().first_cluster = first;
             if first != old.first_cluster {
-                self.persist_file_info(file)?;
+                self.persist_file_info(file).await?;
             }
             self.file_chain_changed(file);
-            self.write_zeros(file, old.length, new_length - old.length)?;
+            self.write_zeros(file, old.length, new_length - old.length)
+                .await?;
             file.file_info_mut().length = new_length;
-            return self.persist_file_info(file);
+            return self.persist_file_info(file).await;
         }
 
         file.file_info_mut().length = new_length;
         if required == 0 {
             file.file_info_mut().first_cluster = None;
         }
-        self.persist_file_info(file)?;
-        self.truncate_chain(old.first_cluster, required)?;
+        self.persist_file_info(file).await?;
+        self.truncate_chain(old.first_cluster, required).await?;
         self.file_chain_changed(file);
         Ok(())
     }
 }
 
 /// Marker for filesystem types providing all read and write capabilities.
+#[maybe_async_cfg::maybe(
+    idents(
+        FileWrite(sync, async = "AsyncFileWrite"),
+        FatFs(sync, async = "AsyncFatFs")
+    ),
+    sync(feature = "sync"),
+    async(feature = "async")
+)]
 pub trait FatFs: FileWrite
 where
     Self::FileHandle: MutableFileHandle,

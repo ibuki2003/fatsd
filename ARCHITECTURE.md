@@ -2,7 +2,8 @@
 
 ## 対象
 
-- `no_std`で利用できる同期API
+- `no_std`で利用できる同期・非同期API
+- defaultの`sync` featureで同期trait、`async` featureで`Async*` traitを提供
 - FAT12 / FAT16 / FAT32
 - 論理セクタ長はBPBから取得。オンディスク位置はbyte offsetで計算し、物理blockへ分割
 - 公開操作: パスによるファイル検索、任意位置読み書き、ファイル作成・伸縮・削除・rename、ディレクトリ作成・削除・rename、FATチェインの参照・確保・解放
@@ -22,6 +23,8 @@
   - `FatFs`: 上記機能をまとめるmarker trait
 - `handle`: default実装が扱う、ファイルとディレクトリの最小メタデータ
 - `write`: directory entry更新、ファイル/ディレクトリ作成・削除・rename、任意位置書き込み、伸縮
+
+`access`と`write`はasync形式を原本とし、`maybe-async-cfg`で同期版と非同期版を生成する。format、volume、handle、errorは両APIで共有する。
 
 ## trait案
 

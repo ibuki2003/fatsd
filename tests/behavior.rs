@@ -1,3 +1,5 @@
+#![cfg(feature = "sync")]
+
 use fatsd::{
     AllocationAccess, BasicDirectoryHandle, BasicFileHandle, BlockAccess, BlockWrite, ChainAccess,
     DirectoryAccess, DirectoryHandle, DirectoryLocation, DirectoryWrite, FatFs, FileAccess,

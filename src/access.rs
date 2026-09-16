@@ -53,6 +53,11 @@ impl<E> From<FormatError> for Error<E> {
 }
 
 /// Provides partial reads from fixed-size physical blocks.
+#[maybe_async_cfg::maybe(
+    idents(BlockAccess(sync, async = "AsyncBlockAccess")),
+    sync(feature = "sync"),
+    async(feature = "async")
+)]
 pub trait BlockAccess {
     /// Error returned by the block device.
     type Error;
@@ -63,7 +68,7 @@ pub trait BlockAccess {
     /// Reads a range contained in one physical block.
     ///
     /// Implementations may assume `offset + out.len() <= self.block_size()`.
-    fn read_block_at(
+    async fn read_block_at(
         &mut self,
         block: u64,
         offset: usize,
@@ -72,14 +77,31 @@ pub trait BlockAccess {
 }
 
 /// Provides partial writes to fixed-size physical blocks.
+#[maybe_async_cfg::maybe(
+    idents(
+        BlockAccess(sync, async = "AsyncBlockAccess"),
+        BlockWrite(sync, async = "AsyncBlockWrite")
+    ),
+    sync(feature = "sync"),
+    async(feature = "async")
+)]
 pub trait BlockWrite: BlockAccess {
     /// Writes a range contained in one physical block.
     ///
     /// Implementations may assume `offset + data.len() <= self.block_size()`.
-    fn write_block_at(&mut self, block: u64, offset: usize, data: &[u8])
-    -> Result<(), Self::Error>;
+    async fn write_block_at(
+        &mut self,
+        block: u64,
+        offset: usize,
+        data: &[u8],
+    ) -> Result<(), Self::Error>;
 }
 
+#[maybe_async_cfg::maybe(
+    idents(BlockAccess(sync, async = "AsyncBlockAccess")),
+    sync(feature = "sync"),
+    async(feature = "async")
+)]
 impl<T: BlockAccess + ?Sized> BlockAccess for &mut T {
     type Error = T::Error;
 
@@ -87,28 +109,44 @@ impl<T: BlockAccess + ?Sized> BlockAccess for &mut T {
         (**self).block_size()
     }
 
-    fn read_block_at(
+    async fn read_block_at(
         &mut self,
         block: u64,
         offset: usize,
         out: &mut [u8],
     ) -> Result<(), Self::Error> {
-        (**self).read_block_at(block, offset, out)
+        (**self).read_block_at(block, offset, out).await
     }
 }
 
+#[maybe_async_cfg::maybe(
+    idents(
+        BlockAccess(sync, async = "AsyncBlockAccess"),
+        BlockWrite(sync, async = "AsyncBlockWrite")
+    ),
+    sync(feature = "sync"),
+    async(feature = "async")
+)]
 impl<T: BlockWrite + ?Sized> BlockWrite for &mut T {
-    fn write_block_at(
+    async fn write_block_at(
         &mut self,
         block: u64,
         offset: usize,
         data: &[u8],
     ) -> Result<(), Self::Error> {
-        (**self).write_block_at(block, offset, data)
+        (**self).write_block_at(block, offset, data).await
     }
 }
 
-fn read_device_at<T: BlockAccess + ?Sized>(
+#[maybe_async_cfg::maybe(
+    idents(
+        BlockAccess(sync, async = "AsyncBlockAccess"),
+        read_device_at(fn, sync, async = "read_device_at_async")
+    ),
+    sync(feature = "sync"),
+    async(feature = "async")
+)]
+async fn read_device_at<T: BlockAccess + ?Sized>(
     device: &mut T,
     mut byte_offset: u64,
     mut out: &mut [u8],
@@ -124,6 +162,7 @@ fn read_device_at<T: BlockAccess + ?Sized>(
         let (part, rest) = out.split_at_mut(length);
         device
             .read_block_at(block, offset, part)
+            .await
             .map_err(Error::Io)?;
         byte_offset = byte_offset
             .checked_add(length as u64)
@@ -133,7 +172,15 @@ fn read_device_at<T: BlockAccess + ?Sized>(
     Ok(())
 }
 
-fn write_device_at<T: BlockWrite + ?Sized>(
+#[maybe_async_cfg::maybe(
+    idents(
+        BlockWrite(sync, async = "AsyncBlockWrite"),
+        write_device_at(fn, sync, async = "write_device_at_async")
+    ),
+    sync(feature = "sync"),
+    async(feature = "async")
+)]
+async fn write_device_at<T: BlockWrite + ?Sized>(
     device: &mut T,
     mut byte_offset: u64,
     mut data: &[u8],
@@ -149,6 +196,7 @@ fn write_device_at<T: BlockWrite + ?Sized>(
         let (part, rest) = data.split_at(length);
         device
             .write_block_at(block, offset, part)
+            .await
             .map_err(Error::Io)?;
         byte_offset = byte_offset
             .checked_add(length as u64)
@@ -159,28 +207,48 @@ fn write_device_at<T: BlockWrite + ?Sized>(
 }
 
 /// Reads and validates the volume metadata from a block device.
-pub fn read_volume<T: BlockAccess + ?Sized>(device: &mut T) -> Result<Volume, Error<T::Error>> {
+#[maybe_async_cfg::maybe(
+    idents(
+        BlockAccess(sync, async = "AsyncBlockAccess"),
+        read_device_at(fn, sync, async = "read_device_at_async"),
+        read_volume(fn, sync, async = "read_volume_async")
+    ),
+    sync(feature = "sync"),
+    async(feature = "async")
+)]
+pub async fn read_volume<T: BlockAccess + ?Sized>(
+    device: &mut T,
+) -> Result<Volume, Error<T::Error>> {
     let mut boot_sector = [0; 512];
-    read_device_at(device, 0, &mut boot_sector)?;
+    read_device_at(device, 0, &mut boot_sector).await?;
     Ok(Volume::from_bpb(Bpb::parse(&boot_sector)?)?)
 }
 
 /// Provides FAT cluster-chain access.
+#[maybe_async_cfg::maybe(
+    idents(
+        BlockAccess(sync, async = "AsyncBlockAccess"),
+        ChainAccess(sync, async = "AsyncChainAccess"),
+        read_device_at(fn, sync, async = "read_device_at_async")
+    ),
+    sync(feature = "sync"),
+    async(feature = "async")
+)]
 pub trait ChainAccess: BlockAccess {
     /// Returns the mounted volume metadata.
     fn volume(&self) -> &Volume;
 
     /// Reads bytes at an absolute volume offset.
-    fn read_volume_at(
+    async fn read_volume_at(
         &mut self,
         byte_offset: u64,
         out: &mut [u8],
     ) -> Result<(), Error<Self::Error>> {
-        read_device_at(self, byte_offset, out)
+        read_device_at(self, byte_offset, out).await
     }
 
     /// Reads the FAT entry for a cluster.
-    fn read_fat_entry(&mut self, cluster: Cluster) -> Result<FatEntry, Error<Self::Error>> {
+    async fn read_fat_entry(&mut self, cluster: Cluster) -> Result<FatEntry, Error<Self::Error>> {
         validate_cluster(self.volume(), cluster)?;
         let volume = *self.volume();
         let fat_start_sector =
@@ -190,25 +258,31 @@ pub trait ChainAccess: BlockAccess {
             FatType::Fat12 => {
                 let mut bytes = [0; 2];
                 let index = cluster.get() as u64;
-                self.read_volume_at(fat_start + index + index / 2, &mut bytes)?;
+                self.read_volume_at(fat_start + index + index / 2, &mut bytes)
+                    .await?;
                 Ok(FatEntry::parse(FatType::Fat12, cluster.get(), &bytes)?)
             }
             FatType::Fat16 => {
                 let mut bytes = [0; 2];
-                self.read_volume_at(fat_start + cluster.get() as u64 * 2, &mut bytes)?;
+                self.read_volume_at(fat_start + cluster.get() as u64 * 2, &mut bytes)
+                    .await?;
                 Ok(FatEntry::parse(FatType::Fat16, cluster.get(), &bytes)?)
             }
             FatType::Fat32 => {
                 let mut bytes = [0; 4];
-                self.read_volume_at(fat_start + cluster.get() as u64 * 4, &mut bytes)?;
+                self.read_volume_at(fat_start + cluster.get() as u64 * 4, &mut bytes)
+                    .await?;
                 Ok(FatEntry::parse(FatType::Fat32, cluster.get(), &bytes)?)
             }
         }
     }
 
     /// Returns the next cluster, or `None` at the end of the chain.
-    fn next_cluster(&mut self, cluster: Cluster) -> Result<Option<Cluster>, Error<Self::Error>> {
-        match self.read_fat_entry(cluster)? {
+    async fn next_cluster(
+        &mut self,
+        cluster: Cluster,
+    ) -> Result<Option<Cluster>, Error<Self::Error>> {
+        match self.read_fat_entry(cluster).await? {
             FatEntry::Data(next) => {
                 let next = Cluster::new(next).ok_or(Error::CorruptChain)?;
                 validate_cluster(self.volume(), next)?;
@@ -222,7 +296,7 @@ pub trait ChainAccess: BlockAccess {
     /// Resolves the cluster at `index` in a chain.
     ///
     /// The default implementation walks the FAT chain from `first`.
-    fn cluster_at(
+    async fn cluster_at(
         &mut self,
         first: Cluster,
         index: u32,
@@ -230,7 +304,8 @@ pub trait ChainAccess: BlockAccess {
         validate_cluster(self.volume(), first)?;
         let mut cluster = first;
         for _ in 0..index {
-            let Some(next) = self.next_cluster(cluster)? else {
+            let next = self.next_cluster(cluster).await?;
+            let Some(next) = next else {
                 return Ok(None);
             };
             cluster = next;
@@ -239,7 +314,7 @@ pub trait ChainAccess: BlockAccess {
     }
 
     /// Reads bytes at an offset within a cluster chain.
-    fn read_chain_at(
+    async fn read_chain_at(
         &mut self,
         first: Cluster,
         offset: u64,
@@ -248,11 +323,13 @@ pub trait ChainAccess: BlockAccess {
         let cluster_size = self.volume().cluster_size() as u64;
         let cluster_index = offset / cluster_size;
         let mut within_cluster = (offset % cluster_size) as usize;
-        let Some(mut cluster) = self.cluster_at(
-            first,
-            u32::try_from(cluster_index).map_err(|_| Error::OutOfBounds)?,
-        )?
-        else {
+        let cluster = self
+            .cluster_at(
+                first,
+                u32::try_from(cluster_index).map_err(|_| Error::OutOfBounds)?,
+            )
+            .await?;
+        let Some(mut cluster) = cluster else {
             return Ok(0);
         };
         let mut read = 0;
@@ -266,11 +343,13 @@ pub trait ChainAccess: BlockAccess {
                 .cluster_byte_offset(cluster)
                 .ok_or(Error::CorruptChain)?
                 + within_cluster as u64;
-            self.read_volume_at(byte_offset, &mut out[read..read + length])?;
+            self.read_volume_at(byte_offset, &mut out[read..read + length])
+                .await?;
             read += length;
             within_cluster = 0;
             if read < out.len() {
-                let Some(next) = self.next_cluster(cluster)? else {
+                let next = self.next_cluster(cluster).await?;
+                let Some(next) = next else {
                     break;
                 };
                 cluster = next;
@@ -300,6 +379,15 @@ pub struct FoundEntry {
 }
 
 /// Provides directory traversal and lookup.
+#[maybe_async_cfg::maybe(
+    idents(
+        BlockAccess(sync, async = "AsyncBlockAccess"),
+        ChainAccess(sync, async = "AsyncChainAccess"),
+        DirectoryAccess(sync, async = "AsyncDirectoryAccess")
+    ),
+    sync(feature = "sync"),
+    async(feature = "async")
+)]
 pub trait DirectoryAccess: ChainAccess {
     /// Application-owned directory handle type.
     type DirectoryHandle: DirectoryHandle + From<DirectoryInfo>;
@@ -313,7 +401,7 @@ pub trait DirectoryAccess: ChainAccess {
     }
 
     /// Reads bytes at an offset within a directory.
-    fn read_directory_at(
+    async fn read_directory_at(
         &mut self,
         directory: &Self::DirectoryHandle,
         offset: u64,
@@ -328,22 +416,26 @@ pub trait DirectoryAccess: ChainAccess {
                 }
                 let read = cmp::min(out.len() as u64, length - offset) as usize;
                 let start = volume.sector_byte_offset(volume.root_directory_start_sector) + offset;
-                self.read_volume_at(start, &mut out[..read])?;
+                self.read_volume_at(start, &mut out[..read]).await?;
                 Ok(read)
             }
-            DirectoryLocation::Cluster(first) => self.read_chain_at(first, offset, out),
+            DirectoryLocation::Cluster(first) => self.read_chain_at(first, offset, out).await,
         }
     }
 
     /// Reads a directory entry by index.
-    fn read_directory_entry(
+    async fn read_directory_entry(
         &mut self,
         directory: &Self::DirectoryHandle,
         index: u32,
     ) -> Result<Option<RawDirEntry>, Error<Self::Error>> {
         let mut bytes = [0; DIRECTORY_ENTRY_SIZE];
         let offset = index as u64 * DIRECTORY_ENTRY_SIZE as u64;
-        if self.read_directory_at(directory, offset, &mut bytes)? != bytes.len() {
+        if self
+            .read_directory_at(directory, offset, &mut bytes)
+            .await?
+            != bytes.len()
+        {
             return Ok(None);
         }
         let entry = RawDirEntry(bytes);
@@ -351,7 +443,7 @@ pub trait DirectoryAccess: ChainAccess {
     }
 
     /// Finds a named entry directly inside a directory.
-    fn find_entry(
+    async fn find_entry(
         &mut self,
         directory: &Self::DirectoryHandle,
         name: &str,
@@ -368,7 +460,9 @@ pub trait DirectoryAccess: ChainAccess {
         let mut lfn_start_index = None;
 
         loop {
-            let read = self.read_directory_at(directory, byte_offset, &mut batch)?;
+            let read = self
+                .read_directory_at(directory, byte_offset, &mut batch)
+                .await?;
             if read == 0 {
                 return Err(Error::NotFound);
             }
@@ -440,13 +534,13 @@ pub trait DirectoryAccess: ChainAccess {
     }
 
     /// Finds an entry by path from the root directory.
-    fn find_entry_by_path(&mut self, path: &str) -> Result<FoundEntry, Error<Self::Error>> {
+    async fn find_entry_by_path(&mut self, path: &str) -> Result<FoundEntry, Error<Self::Error>> {
         let mut components = path
             .split('/')
             .filter(|part| !part.is_empty() && *part != ".");
         let first = components.next().ok_or(Error::InvalidPath)?;
         let mut directory = self.root_directory();
-        let mut entry = self.find_entry(&directory, first)?;
+        let mut entry = self.find_entry(&directory, first).await?;
         for component in components {
             if !entry.raw.is_directory() {
                 return Err(Error::NotADirectory);
@@ -455,17 +549,20 @@ pub trait DirectoryAccess: ChainAccess {
                 location: directory_location(self.volume(), &entry.raw)?,
             }
             .into();
-            entry = self.find_entry(&directory, component)?;
+            entry = self.find_entry(&directory, component).await?;
         }
         Ok(entry)
     }
 
     /// Opens a directory by path from the root directory.
-    fn open_directory(&mut self, path: &str) -> Result<Self::DirectoryHandle, Error<Self::Error>> {
+    async fn open_directory(
+        &mut self,
+        path: &str,
+    ) -> Result<Self::DirectoryHandle, Error<Self::Error>> {
         if path.split('/').all(|part| part.is_empty() || part == ".") {
             return Ok(self.root_directory());
         }
-        let entry = self.find_entry_by_path(path)?;
+        let entry = self.find_entry_by_path(path).await?;
         if !entry.raw.is_directory() {
             return Err(Error::NotADirectory);
         }
@@ -510,13 +607,23 @@ fn entry_first_cluster(volume: &Volume, entry: &RawDirEntry) -> u32 {
 }
 
 /// Provides file lookup and reading.
+#[maybe_async_cfg::maybe(
+    idents(
+        BlockAccess(sync, async = "AsyncBlockAccess"),
+        ChainAccess(sync, async = "AsyncChainAccess"),
+        DirectoryAccess(sync, async = "AsyncDirectoryAccess"),
+        FileAccess(sync, async = "AsyncFileAccess")
+    ),
+    sync(feature = "sync"),
+    async(feature = "async")
+)]
 pub trait FileAccess: DirectoryAccess {
     /// Application-owned file handle type.
     type FileHandle: FileHandle + From<FileInfo>;
 
     /// Opens a file by path from the root directory.
-    fn open_file(&mut self, path: &str) -> Result<Self::FileHandle, Error<Self::Error>> {
-        let entry = self.find_entry_by_path(path)?;
+    async fn open_file(&mut self, path: &str) -> Result<Self::FileHandle, Error<Self::Error>> {
+        let entry = self.find_entry_by_path(path).await?;
         if entry.raw.is_directory() || entry.raw.is_volume_label() {
             return Err(Error::NotAFile);
         }
@@ -536,8 +643,8 @@ pub trait FileAccess: DirectoryAccess {
 
     /// Resolves the cluster at `index` for a file handle.
     ///
-    /// The default implementation delegates to [`ChainAccess::cluster_at`].
-    fn resolve_file_cluster(
+    /// The default implementation delegates to the chain-level `cluster_at` method.
+    async fn resolve_file_cluster(
         &mut self,
         file: &mut Self::FileHandle,
         index: u32,
@@ -545,23 +652,23 @@ pub trait FileAccess: DirectoryAccess {
         let Some(first) = file.file_info().first_cluster else {
             return Ok(None);
         };
-        self.cluster_at(first, index)
+        self.cluster_at(first, index).await
     }
 
     /// Resolves the cluster following `current` during sequential file access.
     ///
-    /// The default implementation delegates to [`ChainAccess::next_cluster`].
-    fn resolve_next_file_cluster(
+    /// The default implementation delegates to the chain-level `next_cluster` method.
+    async fn resolve_next_file_cluster(
         &mut self,
         _file: &mut Self::FileHandle,
         current: Cluster,
         _next_index: u32,
     ) -> Result<Option<Cluster>, Error<Self::Error>> {
-        self.next_cluster(current)
+        self.next_cluster(current).await
     }
 
     /// Reads file data at an absolute file offset.
-    fn read_file_at(
+    async fn read_file_at(
         &mut self,
         file: &mut Self::FileHandle,
         offset: u64,
@@ -578,7 +685,8 @@ pub trait FileAccess: DirectoryAccess {
         let mut within_cluster = (offset % cluster_size) as usize;
         let mut read = 0;
         let mut cluster = self
-            .resolve_file_cluster(file, cluster_index)?
+            .resolve_file_cluster(file, cluster_index)
+            .await?
             .ok_or(Error::CorruptChain)?;
         while read < requested {
             let length = cmp::min(
@@ -590,13 +698,15 @@ pub trait FileAccess: DirectoryAccess {
                 .cluster_byte_offset(cluster)
                 .ok_or(Error::CorruptChain)?
                 + within_cluster as u64;
-            self.read_volume_at(byte_offset, &mut out[read..read + length])?;
+            self.read_volume_at(byte_offset, &mut out[read..read + length])
+                .await?;
             read += length;
             within_cluster = 0;
             if read < requested {
                 cluster_index = cluster_index.checked_add(1).ok_or(Error::OutOfBounds)?;
                 cluster = self
-                    .resolve_next_file_cluster(file, cluster, cluster_index)?
+                    .resolve_next_file_cluster(file, cluster, cluster_index)
+                    .await?
                     .ok_or(Error::CorruptChain)?;
             }
         }
@@ -605,14 +715,29 @@ pub trait FileAccess: DirectoryAccess {
 }
 
 /// Provides cluster allocation and chain mutation.
+#[maybe_async_cfg::maybe(
+    idents(
+        BlockAccess(sync, async = "AsyncBlockAccess"),
+        BlockWrite(sync, async = "AsyncBlockWrite"),
+        ChainAccess(sync, async = "AsyncChainAccess"),
+        AllocationAccess(sync, async = "AsyncAllocationAccess"),
+        write_device_at(fn, sync, async = "write_device_at_async")
+    ),
+    sync(feature = "sync"),
+    async(feature = "async")
+)]
 pub trait AllocationAccess: ChainAccess + BlockWrite {
     /// Writes bytes at an absolute volume offset.
-    fn write_volume_at(&mut self, byte_offset: u64, data: &[u8]) -> Result<(), Error<Self::Error>> {
-        write_device_at(self, byte_offset, data)
+    async fn write_volume_at(
+        &mut self,
+        byte_offset: u64,
+        data: &[u8],
+    ) -> Result<(), Error<Self::Error>> {
+        write_device_at(self, byte_offset, data).await
     }
 
     /// Writes a FAT entry to every active FAT copy.
-    fn write_fat_entry(
+    async fn write_fat_entry(
         &mut self,
         cluster: Cluster,
         value: FatEntry,
@@ -632,14 +757,14 @@ pub trait AllocationAccess: ChainAccess + BlockWrite {
         for fat in first_fat..fat_count {
             let start_sector = volume.fat_start_sector + fat as u32 * volume.fat_sectors();
             let start = volume.sector_byte_offset(start_sector);
-            self.write_one_fat_entry(start, cluster, value)?;
+            self.write_one_fat_entry(start, cluster, value).await?;
         }
-        self.invalidate_fs_info()?;
+        self.invalidate_fs_info().await?;
         Ok(())
     }
 
     /// Invalidates free-space hints in a FAT32 FSInfo sector.
-    fn invalidate_fs_info(&mut self) -> Result<(), Error<Self::Error>> {
+    async fn invalidate_fs_info(&mut self) -> Result<(), Error<Self::Error>> {
         let volume = *self.volume();
         let sector = volume.bpb.fs_info_sector;
         if volume.fat_type == FatType::Fat32
@@ -648,13 +773,13 @@ pub trait AllocationAccess: ChainAccess + BlockWrite {
             && sector < volume.bpb.reserved_sector_count
         {
             let offset = volume.sector_byte_offset(sector as u32) + 488;
-            self.write_volume_at(offset, &[0xff; 8])?;
+            self.write_volume_at(offset, &[0xff; 8]).await?;
         }
         Ok(())
     }
 
     /// Writes an entry to one FAT copy.
-    fn write_one_fat_entry(
+    async fn write_one_fat_entry(
         &mut self,
         fat_start: u64,
         cluster: Cluster,
@@ -666,27 +791,31 @@ pub trait AllocationAccess: ChainAccess + BlockWrite {
                 let index = cluster.get() as u64;
                 let offset = fat_start + index + index / 2;
                 let mut bytes = [0; 2];
-                self.read_volume_at(offset, &mut bytes)?;
+                self.read_volume_at(offset, &mut bytes).await?;
                 value.serialize_into(fat_type, cluster.get(), &mut bytes)?;
-                self.write_volume_at(offset, &bytes)
+                self.write_volume_at(offset, &bytes).await
             }
             FatType::Fat16 => {
                 let mut bytes = [0; 2];
                 value.serialize_into(fat_type, cluster.get(), &mut bytes)?;
                 self.write_volume_at(fat_start + cluster.get() as u64 * 2, &bytes)
+                    .await
             }
             FatType::Fat32 => {
                 let offset = fat_start + cluster.get() as u64 * 4;
                 let mut bytes = [0; 4];
-                self.read_volume_at(offset, &mut bytes)?;
+                self.read_volume_at(offset, &mut bytes).await?;
                 value.serialize_into(fat_type, cluster.get(), &mut bytes)?;
-                self.write_volume_at(offset, &bytes)
+                self.write_volume_at(offset, &bytes).await
             }
         }
     }
 
     /// Finds a free cluster, beginning after an optional hint.
-    fn find_free_cluster(&mut self, start: Option<Cluster>) -> Result<Cluster, Error<Self::Error>> {
+    async fn find_free_cluster(
+        &mut self,
+        start: Option<Cluster>,
+    ) -> Result<Cluster, Error<Self::Error>> {
         let max = self.volume().max_cluster();
         let start = start.map_or(2, Cluster::get);
         if start > max {
@@ -694,7 +823,7 @@ pub trait AllocationAccess: ChainAccess + BlockWrite {
         }
         for raw in (start..=max).chain(2..start) {
             let cluster = Cluster::new(raw).expect("range starts at two");
-            if self.read_fat_entry(cluster)? == FatEntry::Free {
+            if self.read_fat_entry(cluster).await? == FatEntry::Free {
                 return Ok(cluster);
             }
         }
@@ -702,23 +831,27 @@ pub trait AllocationAccess: ChainAccess + BlockWrite {
     }
 
     /// Allocates and clears a cluster, optionally appending it to a chain.
-    fn allocate_cluster(&mut self, after: Option<Cluster>) -> Result<Cluster, Error<Self::Error>> {
+    async fn allocate_cluster(
+        &mut self,
+        after: Option<Cluster>,
+    ) -> Result<Cluster, Error<Self::Error>> {
         if let Some(previous) = after
-            && self.read_fat_entry(previous)? != FatEntry::EndOfChain
+            && self.read_fat_entry(previous).await? != FatEntry::EndOfChain
         {
             return Err(Error::CorruptChain);
         }
-        let cluster = self.find_free_cluster(after)?;
-        self.write_fat_entry(cluster, FatEntry::EndOfChain)?;
-        self.clear_cluster(cluster)?;
+        let cluster = self.find_free_cluster(after).await?;
+        self.write_fat_entry(cluster, FatEntry::EndOfChain).await?;
+        self.clear_cluster(cluster).await?;
         if let Some(previous) = after {
-            self.write_fat_entry(previous, FatEntry::Data(cluster.get()))?;
+            self.write_fat_entry(previous, FatEntry::Data(cluster.get()))
+                .await?;
         }
         Ok(cluster)
     }
 
     /// Fills a cluster with zeroes.
-    fn clear_cluster(&mut self, cluster: Cluster) -> Result<(), Error<Self::Error>> {
+    async fn clear_cluster(&mut self, cluster: Cluster) -> Result<(), Error<Self::Error>> {
         let start = self
             .volume()
             .cluster_byte_offset(cluster)
@@ -727,20 +860,22 @@ pub trait AllocationAccess: ChainAccess + BlockWrite {
         let zeros = [0; 512];
         while offset < self.volume().cluster_size() {
             let length = cmp::min(zeros.len(), self.volume().cluster_size() - offset);
-            self.write_volume_at(start + offset as u64, &zeros[..length])?;
+            self.write_volume_at(start + offset as u64, &zeros[..length])
+                .await?;
             offset += length;
         }
         Ok(())
     }
 
     /// Returns the tail and length of a cluster chain.
-    fn chain_tail_and_length(
+    async fn chain_tail_and_length(
         &mut self,
         first: Cluster,
     ) -> Result<(Cluster, u32), Error<Self::Error>> {
         let mut current = first;
         for length in 1..=self.volume().cluster_count {
-            let Some(next) = self.next_cluster(current)? else {
+            let next = self.next_cluster(current).await?;
+            let Some(next) = next else {
                 return Ok((current, length));
             };
             current = next;
@@ -749,7 +884,7 @@ pub trait AllocationAccess: ChainAccess + BlockWrite {
     }
 
     /// Extends a chain to contain at least `required` clusters.
-    fn ensure_chain_length(
+    async fn ensure_chain_length(
         &mut self,
         first: &mut Option<Cluster>,
         required: u32,
@@ -758,21 +893,21 @@ pub trait AllocationAccess: ChainAccess + BlockWrite {
             return Ok(());
         }
         let (mut tail, mut length) = if let Some(first) = *first {
-            self.chain_tail_and_length(first)?
+            self.chain_tail_and_length(first).await?
         } else {
-            let allocated = self.allocate_cluster(None)?;
+            let allocated = self.allocate_cluster(None).await?;
             *first = Some(allocated);
             (allocated, 1)
         };
         while length < required {
-            tail = self.allocate_cluster(Some(tail))?;
+            tail = self.allocate_cluster(Some(tail)).await?;
             length += 1;
         }
         Ok(())
     }
 
     /// Truncates a chain and returns its retained first cluster.
-    fn truncate_chain(
+    async fn truncate_chain(
         &mut self,
         first: Option<Cluster>,
         keep_clusters: u32,
@@ -781,22 +916,23 @@ pub trait AllocationAccess: ChainAccess + BlockWrite {
             return Ok(None);
         };
         if keep_clusters == 0 {
-            self.free_chain(first)?;
+            self.free_chain(first).await?;
             return Ok(None);
         }
         let last = self
-            .cluster_at(first, keep_clusters - 1)?
+            .cluster_at(first, keep_clusters - 1)
+            .await?
             .ok_or(Error::CorruptChain)?;
-        let tail = self.next_cluster(last)?;
+        let tail = self.next_cluster(last).await?;
         if let Some(tail) = tail {
-            self.write_fat_entry(last, FatEntry::EndOfChain)?;
-            self.free_chain(tail)?;
+            self.write_fat_entry(last, FatEntry::EndOfChain).await?;
+            self.free_chain(tail).await?;
         }
         Ok(Some(first))
     }
 
     /// Writes bytes at an offset within an existing cluster chain.
-    fn write_chain_at(
+    async fn write_chain_at(
         &mut self,
         first: Cluster,
         offset: u64,
@@ -805,11 +941,13 @@ pub trait AllocationAccess: ChainAccess + BlockWrite {
         let cluster_size = self.volume().cluster_size() as u64;
         let cluster_index = offset / cluster_size;
         let mut within_cluster = (offset % cluster_size) as usize;
-        let Some(mut cluster) = self.cluster_at(
-            first,
-            u32::try_from(cluster_index).map_err(|_| Error::OutOfBounds)?,
-        )?
-        else {
+        let cluster = self
+            .cluster_at(
+                first,
+                u32::try_from(cluster_index).map_err(|_| Error::OutOfBounds)?,
+            )
+            .await?;
+        let Some(mut cluster) = cluster else {
             return Ok(0);
         };
         let mut written = 0;
@@ -823,11 +961,13 @@ pub trait AllocationAccess: ChainAccess + BlockWrite {
                 .cluster_byte_offset(cluster)
                 .ok_or(Error::CorruptChain)?
                 + within_cluster as u64;
-            self.write_volume_at(byte_offset, &data[written..written + length])?;
+            self.write_volume_at(byte_offset, &data[written..written + length])
+                .await?;
             written += length;
             within_cluster = 0;
             if written < data.len() {
-                let Some(next) = self.next_cluster(cluster)? else {
+                let next = self.next_cluster(cluster).await?;
+                let Some(next) = next else {
                     break;
                 };
                 cluster = next;
@@ -837,11 +977,11 @@ pub trait AllocationAccess: ChainAccess + BlockWrite {
     }
 
     /// Releases every cluster in a chain.
-    fn free_chain(&mut self, first: Cluster) -> Result<(), Error<Self::Error>> {
+    async fn free_chain(&mut self, first: Cluster) -> Result<(), Error<Self::Error>> {
         let mut current = first;
         for _ in 0..self.volume().cluster_count {
-            let next = self.next_cluster(current)?;
-            self.write_fat_entry(current, FatEntry::Free)?;
+            let next = self.next_cluster(current).await?;
+            self.write_fat_entry(current, FatEntry::Free).await?;
             let Some(next) = next else {
                 return Ok(());
             };

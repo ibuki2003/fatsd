@@ -3,4 +3,18 @@ name = "fatsd"
 version = "0.1.0"
 edition = "2024"
 
+[features]
+default = ["sync"]
+sync = []
+async = []
+
 [dependencies]
+maybe-async-cfg = { version = "0.2.5", default-features = false }
+
+[[example]]
+name = "verify_image"
+required-features = ["sync"]
+
+[[example]]
+name = "write_image"
+required-features = ["sync"]
