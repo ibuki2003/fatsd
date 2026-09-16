@@ -18,3 +18,7 @@ required-features = ["sync"]
 [[example]]
 name = "write_image"
 required-features = ["sync"]
+
+[[example]]
+name = "list_image"
+required-features = ["sync"]

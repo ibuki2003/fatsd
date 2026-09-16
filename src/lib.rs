@@ -28,7 +28,7 @@ pub use access::{
     AsyncAllocationAccess, AsyncBlockAccess, AsyncBlockWrite, AsyncChainAccess,
     AsyncDirectoryAccess, AsyncFileAccess, read_volume_async,
 };
-pub use access::{Error, FoundEntry};
+pub use access::{DirectoryEntry, Error, FoundEntry};
 pub use format::FatType;
 pub use handle::{
     BasicDirectoryHandle, BasicFileHandle, DirectoryEntryLocation, DirectoryHandle, DirectoryInfo,

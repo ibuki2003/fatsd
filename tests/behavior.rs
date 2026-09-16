@@ -366,6 +366,125 @@ fn opens_lfn_and_short_name_and_reads_across_clusters() {
 }
 
 #[test]
+fn enumerates_validated_long_names_and_skips_deleted_entries_and_labels() {
+    let mut fs = test_fs(FatType::Fat16);
+    let root_offset = 3 * 512;
+
+    let mut deleted = [0; 32];
+    deleted[0] = 0xe5;
+    fs.device.bytes[root_offset..root_offset + 32].copy_from_slice(&deleted);
+
+    let mut volume_label = regular_entry(ShortName(*b"VOLUME     "), 0, 0).serialize();
+    volume_label[11] = RawDirEntry::ATTR_VOLUME_ID;
+    fs.device.bytes[root_offset + 32..root_offset + 64].copy_from_slice(&volume_label);
+
+    let long_name = "Long directory name.txt";
+    let short_name = ShortName(*b"LONGDI~1TXT");
+    let mut long_units = [0xffff; 26];
+    let long_length = long_name.encode_utf16().count();
+    for (target, source) in long_units.iter_mut().zip(long_name.encode_utf16()) {
+        *target = source;
+    }
+    long_units[long_length] = 0;
+    for (slot, ordinal) in [2, 1].into_iter().enumerate() {
+        let start = (ordinal - 1) * 13;
+        let lfn = LfnEntry {
+            ordinal: ordinal as u8,
+            is_last: ordinal == 2,
+            checksum: short_name.checksum(),
+            characters: long_units[start..start + 13].try_into().unwrap(),
+        }
+        .serialize()
+        .unwrap();
+        let offset = root_offset + (2 + slot) * 32;
+        fs.device.bytes[offset..offset + 32].copy_from_slice(&lfn.serialize());
+    }
+    let long_short_entry = regular_entry(short_name, 2, 10).serialize();
+    fs.device.bytes[root_offset + 4 * 32..root_offset + 5 * 32].copy_from_slice(&long_short_entry);
+
+    let fallback_short_name = ShortName(*b"FALLBACKTXT");
+    let invalid_lfn = LfnEntry {
+        ordinal: 1,
+        is_last: true,
+        checksum: fallback_short_name.checksum().wrapping_add(1),
+        characters: [b'x' as u16; 13],
+    }
+    .serialize()
+    .unwrap();
+    fs.device.bytes[root_offset + 5 * 32..root_offset + 6 * 32]
+        .copy_from_slice(&invalid_lfn.serialize());
+    let mut fallback = regular_entry(fallback_short_name, 3, 20).serialize();
+    fallback[12] = 0x18;
+    fs.device.bytes[root_offset + 6 * 32..root_offset + 7 * 32].copy_from_slice(&fallback);
+
+    let broken_order_short_name = ShortName(*b"ORDER~1 TXT");
+    let broken_order_lfn = LfnEntry {
+        ordinal: 2,
+        is_last: true,
+        checksum: broken_order_short_name.checksum(),
+        characters: [b'y' as u16; 13],
+    }
+    .serialize()
+    .unwrap();
+    fs.device.bytes[root_offset + 7 * 32..root_offset + 8 * 32]
+        .copy_from_slice(&broken_order_lfn.serialize());
+    let broken_order = regular_entry(broken_order_short_name, 4, 30).serialize();
+    fs.device.bytes[root_offset + 8 * 32..root_offset + 9 * 32].copy_from_slice(&broken_order);
+    fs.device.bytes[root_offset + 9 * 32] = 0;
+
+    let root = fs.root_directory();
+    let mut cursor = 0;
+    let mut small_name = [0; 4];
+    assert_eq!(
+        fs.read_next_directory_entry(&root, &mut cursor, &mut small_name),
+        Err(fatsd::Error::NameBufferTooSmall)
+    );
+    assert_eq!(cursor, 0);
+
+    let mut name = [0; 260];
+    let first = fs
+        .read_next_directory_entry(&root, &mut cursor, &mut name)
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        String::from_utf16(&name[..first.name_length]).unwrap(),
+        long_name
+    );
+    assert_eq!(first.location.index, 4);
+    assert_eq!(first.lfn_start_index, Some(2));
+    assert_eq!(cursor, 5);
+
+    let second = fs
+        .read_next_directory_entry(&root, &mut cursor, &mut name)
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        String::from_utf16(&name[..second.name_length]).unwrap(),
+        "fallback.txt"
+    );
+    assert_eq!(second.location.index, 6);
+    assert_eq!(second.lfn_start_index, None);
+    assert_eq!(cursor, 7);
+
+    let third = fs
+        .read_next_directory_entry(&root, &mut cursor, &mut name)
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        String::from_utf16(&name[..third.name_length]).unwrap(),
+        "ORDER~1.TXT"
+    );
+    assert_eq!(third.location.index, 8);
+    assert_eq!(third.lfn_start_index, None);
+    assert_eq!(cursor, 9);
+    assert_eq!(
+        fs.read_next_directory_entry(&root, &mut cursor, &mut name)
+            .unwrap(),
+        None
+    );
+}
+
+#[test]
 fn allocation_updates_all_fat_copies_and_frees_the_chain() {
     let mut fs = test_fs(FatType::Fat16);
     for fat_sector in [1, 2] {

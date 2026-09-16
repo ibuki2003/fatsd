@@ -4,7 +4,7 @@ use fatsd::{
     AsyncAllocationAccess, AsyncBlockAccess, AsyncBlockWrite, AsyncChainAccess,
     AsyncDirectoryAccess, AsyncDirectoryWrite, AsyncFatFs, AsyncFileAccess, AsyncFileWrite,
     BasicDirectoryHandle, BasicFileHandle,
-    format::Bpb,
+    format::{Bpb, RawDirEntry, ShortName},
     volume::{FatType, Volume},
 };
 
@@ -194,5 +194,38 @@ fn mounts_writes_and_reads_after_pending_io() {
         );
         assert_eq!(&contents[..100], &[0; 100]);
         assert_eq!(&contents[100..], b"async");
+    });
+}
+
+#[test]
+fn enumerates_a_directory_asynchronously() {
+    block_on(async {
+        let mut device = MemoryDevice {
+            bytes: vec![0; 12 * 512],
+            block_size: 128,
+        };
+        bpb().serialize_into(&mut device.bytes).unwrap();
+        let volume = fatsd::read_volume_async(&mut device).await.unwrap();
+        let mut raw = [0; 32];
+        raw[..11].copy_from_slice(&ShortName(*b"ASYNC   TXT").0);
+        raw[11] = RawDirEntry::ATTR_ARCHIVE;
+        device.bytes[3 * 512..3 * 512 + 32].copy_from_slice(&raw);
+        let mut fs = TestFs { device, volume };
+
+        let root = fs.root_directory();
+        let mut cursor = 0;
+        let mut name = [0; 12];
+        let entry = fs
+            .read_next_directory_entry(&root, &mut cursor, &mut name)
+            .await
+            .unwrap()
+            .unwrap();
+
+        assert_eq!(
+            String::from_utf16(&name[..entry.name_length]).unwrap(),
+            "ASYNC.TXT"
+        );
+        assert_eq!(entry.location.index, 0);
+        assert_eq!(cursor, 1);
     });
 }

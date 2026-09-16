@@ -3,7 +3,9 @@
 use core::cmp;
 
 use crate::{
-    format::{Bpb, DIRECTORY_ENTRY_SIZE, FatEntry, FatType, FormatError, LfnEntry, RawDirEntry},
+    format::{
+        Bpb, DIRECTORY_ENTRY_SIZE, FatEntry, FatType, FormatError, LfnEntry, RawDirEntry, ShortName,
+    },
     handle::{
         DirectoryEntryLocation, DirectoryHandle, DirectoryInfo, DirectoryLocation, FileHandle,
         FileInfo,
@@ -36,6 +38,8 @@ pub enum Error<E> {
     DirectoryFull,
     /// The requested name exceeds the FAT limit.
     NameTooLong,
+    /// The caller-provided name buffer is too small.
+    NameBufferTooSmall,
     /// The requested name is not valid for FAT.
     InvalidName,
     /// The directory still contains entries.
@@ -378,6 +382,71 @@ pub struct FoundEntry {
     pub lfn_start_index: Option<u32>,
 }
 
+/// A visible directory entry returned during directory enumeration.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct DirectoryEntry {
+    /// Raw short directory entry.
+    pub raw: RawDirEntry,
+    /// Location of the short directory entry.
+    pub location: DirectoryEntryLocation,
+    /// Index of the first associated long-name entry, if the name buffer contains an LFN.
+    pub lfn_start_index: Option<u32>,
+    /// Number of UTF-16 code units written to the caller-provided name buffer.
+    pub name_length: usize,
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+struct LfnSequence {
+    active: bool,
+    expected_ordinal: u8,
+    checksum: u8,
+    start_index: u32,
+    name_length: usize,
+}
+
+impl LfnSequence {
+    fn reset(&mut self) {
+        *self = Self::default();
+    }
+
+    fn push(&mut self, entry: LfnEntry, index: u32, name: &mut [u16]) {
+        if entry.is_last {
+            self.active = true;
+            self.expected_ordinal = entry.ordinal;
+            self.checksum = entry.checksum;
+            self.start_index = index;
+            self.name_length = entry.ordinal as usize * 13;
+        }
+        if !self.active || entry.ordinal != self.expected_ordinal || entry.checksum != self.checksum
+        {
+            self.reset();
+            return;
+        }
+
+        let start = (entry.ordinal as usize - 1) * 13;
+        for (offset, character) in entry.characters.into_iter().enumerate() {
+            let position = start + offset;
+            if matches!(character, 0 | 0xffff) {
+                self.name_length = cmp::min(self.name_length, position);
+            }
+            if let Some(target) = name.get_mut(position) {
+                *target = character;
+            }
+        }
+        self.expected_ordinal -= 1;
+    }
+
+    fn finish(&mut self, short_name: ShortName) -> Option<(u32, usize)> {
+        let result = (self.active
+            && self.expected_ordinal == 0
+            && self.name_length != 0
+            && short_name.checksum() == self.checksum)
+            .then_some((self.start_index, self.name_length));
+        self.reset();
+        result
+    }
+}
+
 /// Provides directory traversal and lookup.
 #[maybe_async_cfg::maybe(
     idents(
@@ -442,6 +511,68 @@ pub trait DirectoryAccess: ChainAccess {
         Ok((!entry.is_end()).then_some(entry))
     }
 
+    /// Reads the next visible entry and its display name from a directory.
+    ///
+    /// `cursor` is the raw entry index at which scanning starts and is updated to the entry after
+    /// the returned short entry. Deleted entries, volume labels, and LFN entries are not returned.
+    /// A structurally invalid LFN sequence falls back to the associated short name. If `name` is
+    /// too small, the cursor is left unchanged. Short-name bytes are widened to UTF-16, with the
+    /// ASCII lowercase flags applied.
+    async fn read_next_directory_entry(
+        &mut self,
+        directory: &Self::DirectoryHandle,
+        cursor: &mut u32,
+        name: &mut [u16],
+    ) -> Result<Option<DirectoryEntry>, Error<Self::Error>> {
+        let mut index = *cursor;
+        let mut lfn = LfnSequence::default();
+        loop {
+            let raw = self.read_directory_entry(directory, index).await?;
+            let Some(raw) = raw else {
+                *cursor = index;
+                return Ok(None);
+            };
+            let next_index = index.checked_add(1).ok_or(Error::OutOfBounds)?;
+            if raw.is_deleted() {
+                lfn.reset();
+                index = next_index;
+                continue;
+            }
+            if raw.is_lfn() {
+                match LfnEntry::parse(raw) {
+                    Ok(entry) => lfn.push(entry, index, name),
+                    Err(_) => lfn.reset(),
+                }
+                index = next_index;
+                continue;
+            }
+
+            let long_name = lfn.finish(raw.short_name());
+            if raw.is_volume_label() {
+                index = next_index;
+                continue;
+            }
+            let (lfn_start_index, name_length) = if let Some((start, length)) = long_name {
+                if length > name.len() {
+                    return Err(Error::NameBufferTooSmall);
+                }
+                (Some(start), length)
+            } else {
+                (None, write_short_name(&raw, name)?)
+            };
+            *cursor = next_index;
+            return Ok(Some(DirectoryEntry {
+                raw,
+                location: DirectoryEntryLocation {
+                    directory: directory.directory_info().location,
+                    index,
+                },
+                lfn_start_index,
+                name_length,
+            }));
+        }
+    }
+
     /// Finds a named entry directly inside a directory.
     async fn find_entry(
         &mut self,
@@ -454,10 +585,7 @@ pub trait DirectoryAccess: ChainAccess {
         let mut byte_offset = 0u64;
         let mut batch = [0; 512];
         let mut long_name = [0xffff; 260];
-        let mut expected_ordinal = 0u8;
-        let mut checksum = 0u8;
-        let mut lfn_active = false;
-        let mut lfn_start_index = None;
+        let mut lfn = LfnSequence::default();
 
         loop {
             let read = self
@@ -476,38 +604,21 @@ pub trait DirectoryAccess: ChainAccess {
                     return Err(Error::NotFound);
                 }
                 if raw.is_deleted() {
-                    lfn_active = false;
-                    lfn_start_index = None;
+                    lfn.reset();
                     continue;
                 }
                 if raw.is_lfn() {
-                    let Ok(lfn) = LfnEntry::parse(raw) else {
-                        lfn_active = false;
-                        continue;
-                    };
-                    if lfn.is_last {
-                        long_name.fill(0xffff);
-                        expected_ordinal = lfn.ordinal;
-                        checksum = lfn.checksum;
-                        lfn_active = true;
-                        lfn_start_index = Some(entry_index);
+                    match LfnEntry::parse(raw) {
+                        Ok(entry) => lfn.push(entry, entry_index, &mut long_name),
+                        Err(_) => lfn.reset(),
                     }
-                    if !lfn_active || lfn.ordinal != expected_ordinal || lfn.checksum != checksum {
-                        lfn_active = false;
-                        lfn_start_index = None;
-                        continue;
-                    }
-                    let start = (lfn.ordinal as usize - 1) * 13;
-                    long_name[start..start + 13].copy_from_slice(&lfn.characters);
-                    expected_ordinal -= 1;
                     continue;
                 }
 
-                let valid_lfn =
-                    lfn_active && expected_ordinal == 0 && raw.short_name().checksum() == checksum;
-                let lfn_matches = valid_lfn && long_name_matches(&long_name, name);
+                let valid_lfn = lfn.finish(raw.short_name());
+                let lfn_matches = valid_lfn
+                    .is_some_and(|(_, length)| long_name_matches(&long_name[..length], name));
                 let short_matches = raw.short_name().matches(name);
-                lfn_active = false;
                 if !raw.is_volume_label() && (lfn_matches || short_matches) {
                     return Ok(FoundEntry {
                         raw,
@@ -515,10 +626,9 @@ pub trait DirectoryAccess: ChainAccess {
                             directory: directory.directory_info().location,
                             index: entry_index,
                         },
-                        lfn_start_index: valid_lfn.then_some(lfn_start_index).flatten(),
+                        lfn_start_index: valid_lfn.map(|(start, _)| start),
                     });
                 }
-                lfn_start_index = None;
             }
             let consumed = entries.len() * DIRECTORY_ENTRY_SIZE;
             if consumed == 0 {
@@ -573,12 +683,50 @@ pub trait DirectoryAccess: ChainAccess {
     }
 }
 
-fn long_name_matches(buffer: &[u16; 260], name: &str) -> bool {
-    let length = buffer
+fn long_name_matches(buffer: &[u16], name: &str) -> bool {
+    name.encode_utf16().eq(buffer.iter().copied())
+}
+
+fn write_short_name<E>(raw: &RawDirEntry, out: &mut [u16]) -> Result<usize, Error<E>> {
+    let short = raw.short_name().0;
+    let base_length = short[..8]
         .iter()
-        .position(|character| matches!(*character, 0 | 0xffff))
-        .unwrap_or(buffer.len());
-    name.encode_utf16().eq(buffer[..length].iter().copied())
+        .rposition(|byte| *byte != b' ')
+        .map_or(0, |index| index + 1);
+    let extension_length = short[8..]
+        .iter()
+        .rposition(|byte| *byte != b' ')
+        .map_or(0, |index| index + 1);
+    let length = base_length + usize::from(extension_length != 0) + extension_length;
+    if length > out.len() {
+        return Err(Error::NameBufferTooSmall);
+    }
+
+    let lowercase_base = raw.0[12] & 0x08 != 0;
+    let lowercase_extension = raw.0[12] & 0x10 != 0;
+    for (index, byte) in short[..base_length].iter().copied().enumerate() {
+        let byte = if index == 0 && byte == 0x05 {
+            0xe5
+        } else {
+            byte
+        };
+        out[index] = short_name_code_unit(byte, lowercase_base);
+    }
+    if extension_length != 0 {
+        out[base_length] = b'.' as u16;
+        for (index, byte) in short[8..8 + extension_length].iter().copied().enumerate() {
+            out[base_length + 1 + index] = short_name_code_unit(byte, lowercase_extension);
+        }
+    }
+    Ok(length)
+}
+
+fn short_name_code_unit(byte: u8, lowercase: bool) -> u16 {
+    if lowercase && byte.is_ascii_uppercase() {
+        byte.to_ascii_lowercase() as u16
+    } else {
+        byte as u16
+    }
 }
 
 fn directory_location<E>(

@@ -17,7 +17,7 @@
 - `access`
   - `BlockAccess`: 物理block I/O。キャッシュを挟む最下層の境界
   - `ChainAccess`: FATエントリとクラスタチェイン。`cluster_at`がチェイン解決の差し替え境界
-  - `DirectoryAccess`: ディレクトリエントリ走査とパス解決
+  - `DirectoryAccess`: LFNを検証するディレクトリエントリ走査とパス解決
   - `FileAccess`: ファイルハンドル生成と任意位置読み出し
   - `AllocationAccess`: 空きクラスタ検索、リンク、解放
   - `FatFs`: 上記機能をまとめるmarker trait
